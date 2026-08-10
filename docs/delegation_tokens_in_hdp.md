@@ -102,6 +102,8 @@ For example:
 # user request
 curl --negotiate -u : "http://namenode:50070/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=hdfs"
 
+curl --negotiate -u : "https://deb13-spark1.casdds.casd:50470/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=hdfs"
+
 # the API Json response
 {
   "Token": {
