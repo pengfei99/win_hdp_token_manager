@@ -26,17 +26,39 @@ make-creds-file/
 | Java version      | 11 (--release 11)   | Matches the java version of hadoop 3.3.6 |
 | Hadoop dependency | hadoop-common:3.5.0 | Latest stable version                    |
 | Packaging         | Executable JAR      | thin or fat based on user requirement    |
-| Build system      | maven               | Produces a clean, reproducible release   |
+| Build system      | maven 3.9.x+        | Produces a clean, reproducible release   |
 
+> This project requires jdk 11+ and maven 3.9.x+
 
-## 2. How to build 
+## 2. How to build
 
 ```shell
 # go to project root folder
 cd token_convertor
-# 
-mvn clean package
+
+# compile the source file 
+mvn clean compile
+
+# run unit tests
+mvn test 
 ```
 
-## 3. How to run
+To create a Lightweight jar without hadoop-common dependencies, set `hadoop-common` to `<scope>provided</scope>`
+
+```xml
+ <dependency>
+            <groupId>org.apache.hadoop</groupId>
+            <artifactId>hadoop-common</artifactId>
+            <version>${hadoop.version}</version>
+            <scope>provided</scope>
+            <exclusions>
+...
+```
+and run `mvn clean package`
+
+To create a Self-Contained Fat JAR (~50 MB) with the `maven-shade-plugin`, you only need to remove the line `<scope>provided</scope>`.
+and run `mvn clean package`
+
+
+## 3. How to run the application
 
