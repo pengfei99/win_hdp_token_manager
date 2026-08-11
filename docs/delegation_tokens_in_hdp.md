@@ -55,7 +55,10 @@ The common value of the kind string:
 
 ### The service string
 
-The service string should be the `<fqdn>:<port>` or `<ip>:<port>`
+The service string should be in the form of `<fqdn>:<port>` or `<ip>:<port>`.
+
+Instead of building the text object manually, we call the SecurityUtil object to handle all the value validation and
+error handling.
 
 ```java
 SecurityUtil.buildTokenService(new InetSocketAddress(host, port));
@@ -86,7 +89,7 @@ SecurityUtil.buildTokenService(new InetSocketAddress(host, port));
 > In my case, the client is a Windows server, and the user already have Kerberos TGT ticket in his logon session(Step1
 > is ok).
 > For step2, I must use a Windows native service which can read TGT of LSA, so I use `Invoke-WebRequest` from the
-> powershell
+> powershell lib.
 > The `Invoke-WebRequest` calls a REST api endpoint expose by NameNode via WebHDFS service. The authentication of the
 > REST api call is ensured with (SPNEGO via SSPI). Step 3-6 are classic Hadoop cluster mechanism.
 
@@ -121,6 +124,27 @@ curl "http://namenode:50070/webhdfs/v1/user/hdfs/data.csv?op=OPEN&delegation=JQA
 `HADOOP_TOKEN_FILE_LOCATION`
 
 ## How our solution works
+
+Our solution has two major parts:
+- get token and store it in a binary file
+- config all clients (hdfs, pyspark, sparklyr, spark-submit) to use the binary file instead of the kerberos ticket.
+
+### Get token and store it
+
+1. ps script calls WebHDFS REST API (e.g. http://namenode:50070/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=hdfs) with windows native kerberos ticket. If a valid token is returned, go step2. If not raise error
+2. use a java program (jar) to convert the base64 token string to the binary token file. setup env var value `HADOOP_TOKEN_FILE_LOCATION`
+
+### Config all clients
+
+#### hdfs client
+For hdfs client to use token instead of kerberos ticket, we need to 
+
+#### spark-submit client
+
+#### pyspark client
+
+#### sparklyr client
+
 
 ## Some default values of the token
 
