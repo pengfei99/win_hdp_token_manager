@@ -137,6 +137,7 @@ Our solution has two major parts:
 ### Config all clients
 
 #### hdfs client
+
 For hdfs client to use token instead of kerberos ticket, we need to 
 
 #### spark-submit client
