@@ -26,13 +26,19 @@
     Security:    Requires valid Cluster CA installed in Windows Trusted Root Store.
 #>
 
+[CmdletBinding()]
 param(
+    [Parameter(Mandatory=$false)]
     [string] $Out,
+
+    [Parameter(Mandatory=$false)]
     [switch] $Cancel,
+
+    [Parameter(Mandatory=$false)]
     [switch] $Quiet
 )
 
-# Enforce strict error handling: any unhandled exception immediately stops execution.
+# Enforce strict error handling for the main execution flow.
 $ErrorActionPreference = "Stop"
 
 # User-level registry locations for configuration and active session state tracking.
@@ -43,12 +49,18 @@ $REG_SESS = "$REG\Sessions"
 # LOGGING & CONSOLE OUTPUT HELPERS
 # ==============================================================================
 
-<#
-.SYNOPSIS
-    Writes messages to standard output unless -Quiet is passed.
-#>
-function Write-LogMessage([string]$msg) {
-    if (-not $Quiet) { Write-Host $msg }
+function Write-LogMessage {
+    param([string]$Message, [string]$Level = "INFO")
+
+    if ($Quiet) { return }
+
+    switch ($Level) {
+        "ERROR"   { Write-Host "[ERROR] $Message" -ForegroundColor Red }
+        "WARNING" { Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
+        default   { Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
+    }
+    # Also send to verbose stream for pipeline compatibility
+    Write-Verbose $Message
 }
 
 # ==============================================================================
@@ -57,6 +69,7 @@ function Write-LogMessage([string]$msg) {
 
 # Enforce strong TLS encryption (TLS 1.2 / TLS 1.3).
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+
 # Cluster CA certificates MUST be deployed to the Windows Trusted Root Store. Todo, for now we trust all.
 if (-not ("TrustAllCerts" -as [type])) {
 Add-Type @"
@@ -69,6 +82,8 @@ public static class TrustAllCerts {
 "@
 }
 [TrustAllCerts]::Enable()
+
+
 <#
 .SYNOPSIS
     Reads Hadoop client configuration from HKCU registry.
@@ -93,24 +108,32 @@ $c = Get-HadoopConfig
 .PARAMETER filePath
     Path to the token file requiring ACL hardening.
 #>
-function Protect-TokenFile([string]$filePath) {
+function Protect-TokenFile {
+    param([string]$filePath)
     if (-not (Test-Path $filePath)) { return }
 
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
-    # Instantiate ACL object and disable inheritance ($true), discarding inherited rules ($false)
-    $acl = Get-Acl $filePath
-    $acl.SetAccessRuleProtection($true, $false)
+    try {
+        # Instantiate ACL object and disable inheritance ($true), discarding inherited rules ($false)
+        $acl = Get-Acl $FilePath
+        $acl.SetAccessRuleProtection($true, $false)
 
-    # Define explicit access rules
-    $accessRuleUser   = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, "FullControl", "Allow")
-    $accessRuleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "Allow")
+        # Clear existing explicit rules to ensure a clean slate before adding new ones
+        $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
 
-    $acl.AddAccessRule($accessRuleUser)
-    $acl.AddAccessRule($accessRuleSystem)
+        # Define explicit access rules
+        $accessRuleUser   = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, "FullControl", "Allow")
+        $accessRuleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "Allow")
 
-    # Apply hardened ACL back to the file
-    Set-Acl -Path $filePath -AclObject $acl
+        $acl.AddAccessRule($accessRuleUser)
+        $acl.AddAccessRule($accessRuleSystem)
+
+        # Apply hardened ACL back to the file
+        Set-Acl -Path $FilePath -AclObject $acl
+    } catch {
+        Write-LogMessage "Failed to apply NTFS permissions to $FilePath : $($_.Exception.Message)" "WARNING"
+    }
 }
 
 # ==============================================================================
@@ -121,27 +144,54 @@ function Protect-TokenFile([string]$filePath) {
 .SYNOPSIS
     Executes REST API requests using Windows Integrated Authentication (Kerberos/SPNEGO).
 #>
-function Invoke-Sso([string]$uri, [string]$method = "GET", [string]$body = $null, [hashtable]$headers = $null) {
+function Invoke-Sso {
+    param(
+        [string]$Uri,
+        [string]$Method = "GET",
+        [string]$Body = $null,
+        [hashtable]$Headers = $null
+    )
+
     $params = @{
-        Uri                   = $uri
-        Method                = $method
+        Uri                   = $Uri
+        Method                = $Method
         UseDefaultCredentials = $true  # Uses logged-in Windows user Kerberos ticket
         SkipHttpErrorCheck    = $false
     }
 
-    if ($body)    { $params.Body = $body; $params.ContentType = "application/json" }
-    if ($headers) { $params.Headers = $headers }
+    if ($Body)    { $params.Body = $Body; $params.ContentType = "application/json" }
+    if ($Headers) { $params.Headers = $Headers }
 
     try {
         return (Invoke-RestMethod @params)
     } catch {
-        # Read API response body on failure for diagnostic insights
-        $responseError = try {
-            (New-Object IO.StreamReader($_.Exception.Response.GetResponseStream())).ReadToEnd()
-        } catch {
-            $_.Exception.Message
+        $errorMessage = $_.Exception.Message
+
+        # Robust error extraction for both PS 5.1 (WebException) and PS 7+ (HttpResponseException)
+        if ($_.Exception.Response) {
+            try {
+                $responseBody = ""
+                # PS 5.1 / WebException
+                if ($_.Exception.Response.GetResponseStream) {
+                    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
+                    $reader.BaseStream.Position = 0
+                    $reader.DiscardBufferedData()
+                    $responseBody = $reader.ReadToEnd()
+                }
+                # PS 7+ / HttpResponseMessage
+                elseif ($_.Exception.Response.Content -and $_.Exception.Response.Content.ReadAsStringAsync) {
+                    $responseBody = $_.Exception.Response.Content.ReadAsStringAsync().Result
+                }
+
+                if ($responseBody) {
+                    $errorMessage = "HTTP $($_.Exception.Response.StatusCode) - $responseBody"
+                }
+            } catch {
+                # Fallback if stream reading fails
+            }
         }
-        throw "REST Call Failure [$method $uri]: $responseError"
+
+        throw "REST Call Failure [$Method $Uri]: $errorMessage"
     }
 }
 
@@ -155,7 +205,7 @@ function Invoke-Sso([string]$uri, [string]$method = "GET", [string]$body = $null
 #>
 function New-HdfsToken {
     $endpoint = "$($c.NameNodeWeb)/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=$($c.Renewer)"
-    $response = Invoke-Sso -uri $endpoint
+    $response = Invoke-Sso -Uri $endpoint
     $token = $response.Token.urlString
 
     if (-not $token) { throw "Empty HDFS token returned by NameNode." }
@@ -169,7 +219,7 @@ function New-HdfsToken {
 function New-RmToken {
     $endpoint = "$($c.RmWeb)/ws/v1/cluster/delegation-token"
     $body = @{ renewer = $c.Renewer } | ConvertTo-Json
-    $response = Invoke-Sso -uri $endpoint -method "POST" -body $body
+    $response = Invoke-Sso -Uri $endpoint -Method "POST" -Body $body
     $token = $response.token
 
     if (-not $token) { throw "Empty Resource Manager token returned." }
@@ -180,13 +230,14 @@ function New-RmToken {
 .SYNOPSIS
     Revokes an active HDFS token on the cluster.
 #>
-function Revoke-HdfsToken([string]$tok) {
-    if (-not $tok) { return }
+function Revoke-HdfsToken {
+    param([string]$Token)
+    if (-not $Token) { return }
     try {
-        $endpoint = "$($c.NameNodeWeb)/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=$tok"
-        Invoke-Sso -uri $endpoint -method "PUT" | Out-Null
+        $endpoint = "$($c.NameNodeWeb)/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=$Token"
+        Invoke-Sso -Uri $endpoint -Method "PUT" | Out-Null
     } catch {
-        Write-LogMessage "  (HDFS revocation ignored: $($_.Exception.Message))"
+        Write-LogMessage "HDFS revocation ignored: $($_.Exception.Message)" "WARNING"
     }
 }
 
@@ -194,14 +245,15 @@ function Revoke-HdfsToken([string]$tok) {
 .SYNOPSIS
     Revokes an active YARN Resource Manager token on the cluster.
 #>
-function Revoke-RmToken([string]$tok) {
-    if (-not $tok) { return }
+function Revoke-RmToken {
+    param([string]$Token)
+    if (-not $Token) { return }
     try {
         $endpoint = "$($c.RmWeb)/ws/v1/cluster/delegation-token"
-        $headers  = @{ "X-Hadoop-Delegation-Token" = $tok }
-        Invoke-Sso -uri $endpoint -method "DELETE" -headers $headers | Out-Null
+        $headers  = @{ "X-Hadoop-Delegation-Token" = $Token }
+        Invoke-Sso -Uri $endpoint -Method "DELETE" -Headers $headers | Out-Null
     } catch {
-        Write-LogMessage "  (RM revocation ignored: $($_.Exception.Message))"
+        Write-LogMessage "RM revocation ignored: $($_.Exception.Message)" "WARNING"
     }
 }
 
@@ -209,17 +261,27 @@ function Revoke-RmToken([string]$tok) {
 # SESSION LIFECYCLE MANAGEMENT
 # ==============================================================================
 
-function Get-SessionKey([string]$id) { "$REG_SESS\$id" }
+function Get-SessionKey {
+    param([string]$Id)
+    return "$REG_SESS\$Id"
+}
 
 <#
 .SYNOPSIS
     Cleans up local token files, registry tracking keys, and revokes cluster tokens.
 #>
-function Remove-Session([string]$id) {
-    $keyPath = Get-SessionKey $id
+function Remove-Session {
+    param([string]$Id)
+
+    $keyPath = Get-SessionKey $Id
     if (-not (Test-Path $keyPath)) { return }
 
-    $session = Get-ItemProperty -Path $keyPath
+    $session = Get-ItemProperty -Path $keyPath -ErrorAction SilentlyContinue
+    if (-not $session) {
+        # Key exists but is empty or corrupt, just delete it
+        Remove-Item -Path $keyPath -Recurse -Force -ErrorAction SilentlyContinue
+        return
+    }
 
     # 1. Revoke tokens remotely on the Hadoop cluster
     if ($session.HdfsToken) { Revoke-HdfsToken $session.HdfsToken }
@@ -227,8 +289,14 @@ function Remove-Session([string]$id) {
 
     # 2. Delete binary token file and associated Java CRC checksum file
     if ($session.TokenFile -and (Test-Path $session.TokenFile)) {
-        $crcFile = Join-Path (Split-Path $session.TokenFile) (".$(Split-Path $session.TokenFile -Leaf).crc")
-        Remove-Item $session.TokenFile, $crcFile -Force -ErrorAction SilentlyContinue
+        $fileName = Split-Path $session.TokenFile -Leaf
+        $fileDir  = Split-Path $session.TokenFile -Parent
+        $crcFile  = Join-Path $fileDir ".$fileName.crc"
+
+        Remove-Item $session.TokenFile -Force -ErrorAction SilentlyContinue
+        if (Test-Path $crcFile) {
+            Remove-Item $crcFile -Force -ErrorAction SilentlyContinue
+        }
     }
 
     # 3. Purge session record from local registry
@@ -242,18 +310,56 @@ function Remove-Session([string]$id) {
 function Clear-OrphanSessions {
     if (-not (Test-Path $REG_SESS)) { return }
 
-    foreach ($key in Get-ChildItem $REG_SESS) {
+    # Temporarily allow errors so a failure to clean up one session doesn't abort the script
+    $savedEap = $ErrorActionPreference
+    $ErrorActionPreference = "Continue"
+
+    foreach ($key in Get-ChildItem $REG_SESS -ErrorAction SilentlyContinue) {
         $sessionId = $key.PSChildName
 
         # Skip current process ID
         if ($sessionId -eq "$PID") { continue }
 
-        # If the process ID is no longer running in Task Manager, clean up its orphaned tokens
-        if (-not (Get-Process -Id $sessionId -ErrorAction SilentlyContinue)) {
+        $session = Get-ItemProperty -Path $key.PSPath -ErrorAction SilentlyContinue
+        if (-not $session) {
+            Remove-Item -Path $key.PSPath -Recurse -Force -ErrorAction SilentlyContinue
+            continue
+        }
+
+        $isOrphan = $false
+
+        try {
+            $proc = Get-Process -Id $sessionId -ErrorAction SilentlyContinue
+            if (-not $proc) {
+                $isOrphan = $true
+            } else {
+                # SECURITY FIX: Check for PID Reuse
+                # If the process exists, verify its start time matches the session creation time.
+                # If the process started AFTER the registry entry was created, it's a new process
+                # that reused the old PID, meaning the original session is dead (orphaned).
+                if ($session.Created) {
+                    $regTime = [datetime]::Parse($session.Created)
+                    # Allow a small buffer (e.g., 5 seconds) for clock skew or process startup time
+                    if ($proc.StartTime -gt $regTime.AddSeconds(5)) {
+                        $isOrphan = $true
+                        Write-LogMessage "Detected PID reuse for $sessionId. Original session is orphaned." "WARNING"
+                    }
+                } else {
+                    # If no Created timestamp exists (legacy entry), assume orphan if PID doesn't match current user
+                    $isOrphan = $true
+                }
+            }
+        } catch {
+            $isOrphan = $true
+        }
+
+        if ($isOrphan) {
             Write-LogMessage "Revoking tokens for terminated session (PID: $sessionId)"
             Remove-Session $sessionId
         }
     }
+
+    $ErrorActionPreference = $savedEap
 }
 
 # ==============================================================================
@@ -274,9 +380,20 @@ if ($Cancel) {
 .SYNOPSIS
     Invokes helper Java class (MakeCredsFile) to format raw tokens into a Hadoop .dt container file.
 #>
-function Write-CredsFile([string]$destinationPath, [string]$hdfsTok, [string]$rmTok) {
+function Write-CredsFile {
+    param(
+        [string]$DestinationPath,
+        [string]$HdfsTok,
+        [string]$RmTok
+    )
+
     # Dynamically extract Hadoop Java classpath
-    $classpath = (hdfs classpath | Out-String).Trim()
+    $classpath = ""
+    try {
+        $classpath = (hdfs classpath 2>$null | Out-String).Trim()
+    } catch {
+        Write-LogMessage "Could not determine Hadoop classpath. Ensure 'hdfs' is in your system PATH." "WARNING"
+    }
 
     # Temporarily unset variable to prevent recursion during MakeCredsFile run
     $savedEnv = $env:HADOOP_TOKEN_FILE_LOCATION
@@ -285,12 +402,19 @@ function Write-CredsFile([string]$destinationPath, [string]$hdfsTok, [string]$rm
     $savedEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
 
+    # Build arguments array to handle paths with spaces safely via Splatting
+    $javaArgs = @(
+        "-cp", "$classpath;$($c.ToolsPath)",
+        "MakeCredsFile",
+        $DestinationPath,
+        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($c.ServiceIp):$($c.HdfsRpcPort)",
+        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($c.ServiceFqdn):$($c.HdfsRpcPort)",
+        "RM_DELEGATION_TOKEN",   $RmTok,   "$($c.ServiceIp):$($c.RmRpcPort)",
+        "RM_DELEGATION_TOKEN",   $RmTok,   "$($c.ServiceFqdn):$($c.RmRpcPort)"
+    )
+
     # Invoke Java binary helper
-    $output = & java -cp "$classpath;$($c.ToolsPath)" MakeCredsFile $destinationPath `
-      HDFS_DELEGATION_TOKEN "$hdfsTok" "$($c.ServiceIp):$($c.HdfsRpcPort)" `
-      HDFS_DELEGATION_TOKEN "$hdfsTok" "$($c.ServiceFqdn):$($c.HdfsRpcPort)" `
-      RM_DELEGATION_TOKEN   "$rmTok"   "$($c.ServiceIp):$($c.RmRpcPort)" `
-      RM_DELEGATION_TOKEN   "$rmTok"   "$($c.ServiceFqdn):$($c.RmRpcPort)" 2>&1
+    $output = & java @javaArgs 2>&1
 
     $exitCode = $LASTEXITCODE
 
@@ -298,12 +422,21 @@ function Write-CredsFile([string]$destinationPath, [string]$hdfsTok, [string]$rm
     $ErrorActionPreference = $savedEap
     $env:HADOOP_TOKEN_FILE_LOCATION = $savedEnv
 
-    if (-not $Quiet) { $output | ForEach-Object { Write-Host $_ } }
+    if (-not $Quiet) {
+        $output | ForEach-Object {
+            if ($_ -match "ERROR|Exception|Fail") {
+                Write-Host $_ -ForegroundColor Red
+            } else {
+                Write-Host $_
+            }
+        }
+    }
+
     if ($exitCode -ne 0) { throw "MakeCredsFile failed with exit code $exitCode" }
-    if (-not (Test-Path $destinationPath)) { throw "Target file $destinationPath was not created." }
+    if (-not (Test-Path $DestinationPath)) { throw "Target file $DestinationPath was not created." }
 
     # Lock down file permissions immediately after creation
-    Protect-TokenFile $destinationPath
+    Protect-TokenFile $DestinationPath
 }
 
 # ==============================================================================
@@ -311,7 +444,7 @@ function Write-CredsFile([string]$destinationPath, [string]$hdfsTok, [string]$rm
 # ==============================================================================
 
 if ($Out) {
-    Write-CredsFile -destinationPath $Out -hdfsTok (New-HdfsToken) -rmTok (New-RmToken)
+    Write-CredsFile -DestinationPath $Out -HdfsTok (New-HdfsToken) -RmTok (New-RmToken)
     return
 }
 
@@ -334,7 +467,7 @@ $tokenFilePath = Join-Path $c.TokenDir "hadoop-$PID.dt"
 # Fetch fresh tokens and write Java token file
 $hdfsTok = New-HdfsToken
 $rmTok   = New-RmToken
-Write-CredsFile -destinationPath $tokenFilePath -hdfsTok $hdfsTok -rmTok $rmTok
+Write-CredsFile -DestinationPath $tokenFilePath -HdfsTok $hdfsTok -RmTok $rmTok
 
 # Update Registry Session State
 $sessionKey = Get-SessionKey $PID
@@ -342,7 +475,10 @@ New-Item -Path $sessionKey -Force | Out-Null
 Set-ItemProperty -Path $sessionKey -Name "TokenFile" -Value $tokenFilePath -Type String -Force
 Set-ItemProperty -Path $sessionKey -Name "HdfsToken" -Value $hdfsTok       -Type String -Force
 Set-ItemProperty -Path $sessionKey -Name "RmToken"   -Value $rmTok         -Type String -Force
-Set-ItemProperty -Path $sessionKey -Name "Created"   -Value (Get-Date).ToString("o") -Type String -Force
+
+# Store creation time to detect PID reuse in orphan cleanup
+$creationTime = (Get-Date).ToString("o")
+Set-ItemProperty -Path $sessionKey -Name "Created"   -Value $creationTime -Type String -Force
 
 # Export environment variable for child processes (R, Python, Spark, etc.)
 [Environment]::SetEnvironmentVariable("HADOOP_TOKEN_FILE_LOCATION", $tokenFilePath, "User")
