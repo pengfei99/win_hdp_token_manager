@@ -779,6 +779,7 @@ generate_casd_token <- function() {
 # Important:
 #
 #   If spark_connect() fails, the generated token is cleaned up.
+#   Added `...` as argument so `extra_args <- list(...)` doesn't crash R
 # =====================================================================
 #' @param config Optional sparklyr configuration object.
 #' @param master Spark master URL (default: "yarn").
@@ -789,7 +790,9 @@ generate_casd_token <- function() {
 casd_spark_connect <- function(config = NULL,
                                master = "yarn",
                                app_name = "rstudio",
-                               driver_port = NULL) {
+                               driver_port = NULL,
+                               ...) {
+
  # Checks if the package is installed without attaching it to the global search path
   if (!requireNamespace("sparklyr", quietly = TRUE)) {
     stop("Package Error: 'sparklyr' is required but not installed.", call. = FALSE)
@@ -856,9 +859,7 @@ casd_spark_connect <- function(config = NULL,
   # tokens. The below settings prevent Spark from trying to generate other
   # credential tokens automatically.
   # -------------------------------------------------------------------
-  cfg$spark.security.credentials.hadoopfs.enabled <- "false"
-  cfg$spark.security.credentials.hive.enabled     <- "false"
-  cfg$spark.security.credentials.hbase.enabled    <- "false"
+  for (cred in CASD_DISABLED_CREDENTIALS) cfg[[cred]] <- "false"
 
   # -------------------------------------------------------------------
   # Driver port resolution
@@ -877,7 +878,6 @@ casd_spark_connect <- function(config = NULL,
   # if driver_port is not valid, the function return a null value
   user_input_port <- .casd_parse_port(driver_port)
 
-  # If the user explicitly supplied a bad port, fail.
   # If the user explicitly supplied a bad port, fail.
   if (!.casd_is_blank(driver_port) && is.null(user_input_port)) {
     stop(
@@ -908,8 +908,8 @@ casd_spark_connect <- function(config = NULL,
     # - user/config did not already set it
     # - the resulting port is valid
     # ---------------------------------------------------------------
-    if (.casd_is_blank(cfg[["spark.driver.blockManager.port"]])) {
-      bm_port <- final_port + 200L
+    if (is.null(cfg[["spark.driver.blockManager.port"]])) {
+      bm_port <- final_driver_port + CASD_BLOCK_MANAGER_OFFSET
 
       # last check on blockManager port
       if (bm_port <= 65535L) {
