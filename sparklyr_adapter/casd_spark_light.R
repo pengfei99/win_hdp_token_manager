@@ -1,102 +1,25 @@
-# =====================================================================
-# CASD sparklyr + Hadoop delegation token helper
-# =====================================================================
-#
-# High-level workflow:
-#
-# 1. Read CASD configuration from the Windows registry.
-# 2. If connecting to YARN:
-#    - generate a temporary Hadoop delegation token file
-#    - set HADOOP_TOKEN_FILE_LOCATION to that file
-# 3. Connect to Spark using sparklyr.
-# 4. On disconnect:
-#    - disconnect Spark
-#    - delete the temporary token file
-#    - restore/unset HADOOP_TOKEN_FILE_LOCATION
-#
-# Important design choice:
-# - We use an environment (.casd_state) as hidden mutable state.
-# - This avoids polluting the global namespace with many variables.
-# - It also allows functions to share and update state over time.
-# =====================================================================
-
-# =====================================================================
-# USER CONFIGURATION
-# =====================================================================
-# Modify these values to customize the behavior of the script
-# without touching the core logic below.
-# =====================================================================
-
-# 1. REGISTRY CONFIGURATION
-# The Windows Registry path (under HKEY_CURRENT_USER) where CASD
-# Hadoop configuration (ToolsPath, SparkHome, etc.) is stored.
 CASD_REGISTRY_PATH <- "Software\\CASD\\Hadoop"
 
-# 2. TOKEN GENERATION CONFIGURATION
-# Name of the PowerShell script used to generate tokens.
-# This script is expected to be located in the ToolsPath defined in the registry.
 CASD_TOKEN_SCRIPT_NAME <- "refresh-tokens.ps1"
 
-# Prefix and file extension for the temporary token files created in tempdir().
 CASD_TOKEN_PREFIX <- "hadoop-r-"
 CASD_TOKEN_EXT    <- ".dt"
 
-# Timeout in seconds for the PowerShell token generation script.
-# Set to 0 for no timeout.
 CASD_DEFAULT_TIMEOUT <- 60L
 
-# 3. SPARK CONNECTION DEFAULTS
-# Default Spark master URL and application name.
 CASD_DEFAULT_MASTER   <- "yarn"
 CASD_DEFAULT_APP_NAME <- "rstudio"
 
-# Default driver port.
-# NULL means let Spark choose a random available port (Recommended for multiple sessions).
-# Set to an integer (e.g., 7077L) to force a specific port.
 CASD_DEFAULT_DRIVER_PORT <- 7077L
 
-# Offset added to the driver port to calculate the block manager port.
-# E.g., if driver port is 7077, block manager port will be 7277.
 CASD_BLOCK_MANAGER_OFFSET <- 200L
 
-# 4. SPARK SECURITY CONFIGURATION
-# Spark credential providers to disable.
-# Because this helper manually manages HADOOP_TOKEN_FILE_LOCATION, we disable
-# Spark's built-in credential providers to prevent conflicts.
-# Set to character(0) or NULL if you want Spark to manage these automatically.
 CASD_DISABLED_CREDENTIALS <- c(
   "spark.security.credentials.hadoopfs.enabled",
   "spark.security.credentials.hive.enabled",
   "spark.security.credentials.hbase.enabled"
 )
 
-
-# ---------------------------------------------------------------------
-# State management
-# ---------------------------------------------------------------------
-
-# .casd_state is a hidden mutable environment.
-#
-# Why an environment?
-# - R function environments allow mutation without using global variables to avoid namespace pollution.
-# - This acts like a private "singleton" object which works across on all functions.
-#
-# Fields:
-# - tokens:
-#     Tracks all token files created by this helper.
-#     Key: token file basename
-#     Value: full normalized token file path
-#
-# - last_token:
-#     The most recently generated token path.
-#
-# - has_original_token_env:
-#     TRUE if we saved the user's original HADOOP_TOKEN_FILE_LOCATION.
-#
-# - original_token_env:
-#     The original value of HADOOP_TOKEN_FILE_LOCATION before we changed it.
-#     If it was blank, we store NA_character_.
-# ---------------------------------------------------------------------
 
 .casd_state <- new.env(parent = emptyenv())
 .casd_state$tokens <- new.env(parent = emptyenv())
@@ -105,47 +28,14 @@ CASD_DISABLED_CREDENTIALS <- c(
 .casd_state$has_original_token_env <- FALSE
 .casd_state$original_token_env <- NULL
 
-# ---------------------------------------------------------------------
-# NULL-coalescing operator
-# ---------------------------------------------------------------------
-#
-# x %||% y returns:
-# - x if x is not NULL
-# - y if x is NULL
-#
-# This is useful for fallback logic, for example:
-# final_port <- explicit_port %||% config_port %||% registry_port
-# ---------------------------------------------------------------------
 `%||%` <- function(x, y) {
   if (is.null(x)) y else x
 }
 
-# ---------------------------------------------------------------------
-# Internal helper: check if OS is Windows
-# ---------------------------------------------------------------------
-#
-# This helper is designed for Windows only because it reads the
-# Windows registry and uses PowerShell.
-# ---------------------------------------------------------------------
-#' @noRd
 .casd_is_windows <- function() {
   .Platform$OS.type == "windows"
 }
 
-# ---------------------------------------------------------------------
-# Internal helper: check whether a value is blank/empty
-# ---------------------------------------------------------------------
-#
-# This is used for optional config values.
-#
-# Examples of blank values:
-# - NULL
-# - character(0)
-# - ""
-# - "   "
-# - NA
-# ---------------------------------------------------------------------
-#' @noRd
 .casd_is_blank <- function(x) {
   if (is.null(x) || length(x) == 0L) return(TRUE)
 
@@ -165,24 +55,6 @@ CASD_DISABLED_CREDENTIALS <- c(
   !any(nzchar(trimws(val)))
 }
 
-# ---------------------------------------------------------------------
-# Internal helper: safely extract the first character value
-# ---------------------------------------------------------------------
-#
-# Registry values can sometimes be:
-# - NULL
-# - empty
-# - numeric
-# - character vectors
-# - quoted strings
-#
-# This function tries to convert the first element to a clean string.
-#
-# Returns:
-# - A cleaned string if available
-# - NA_character_ if missing/empty/invalid
-# ---------------------------------------------------------------------
-#' @noRd
 .casd_first_chr <- function(x) {
   # If the input is missing or empty, return NA.
   if (is.null(x) || length(x) == 0L) return(NA_character_)
@@ -212,16 +84,6 @@ CASD_DISABLED_CREDENTIALS <- c(
   if (!nzchar(val)) NA_character_ else val
 }
 
-# ---------------------------------------------------------------------
-# Internal helper: normalize a path if it looks valid
-# ---------------------------------------------------------------------
-#
-# normalizePath() converts paths to a standard absolute form.
-#
-# We use mustWork = FALSE because some configured directories may not
-# exist yet, and we want to warn later instead of failing immediately.
-# ---------------------------------------------------------------------
-#' @noRd
 .casd_normalize_path <- function(x) {
   if (is.character(x) && length(x) == 1L && !is.na(x) && nzchar(x)) {
     normalizePath(x, mustWork = FALSE)
@@ -230,20 +92,6 @@ CASD_DISABLED_CREDENTIALS <- c(
   }
 }
 
-# ---------------------------------------------------------------------
-# Internal helper: set environment variable only if blank
-# ---------------------------------------------------------------------
-#
-# This is a safer default than overwriting existing environment vars.
-#
-# Example:
-# If SPARK_HOME is already set by the user, we leave it alone.
-#
-# If your CASD environment requires registry values to override the
-# current environment, replace calls to this function with direct
-# Sys.setenv() calls.
-# ---------------------------------------------------------------------
-#' @noRd
 .casd_set_env_if_blank <- function(name, value) {
   # Only set the environment variable if:
   # - value is a non-missing string
@@ -266,21 +114,6 @@ CASD_DISABLED_CREDENTIALS <- c(
 
   invisible(Sys.getenv(name))
 }
-# ---------------------------------------------------------------------
-# Internal helper: locate PowerShell executable
-# ---------------------------------------------------------------------
-#
-# We try common PowerShell executable names.
-#
-# Order:
-# 1. Windows PowerShell: powershell.exe
-# 2. PowerShell Core: pwsh.exe
-# 3. Unqualified names, in case PATH resolution works differently
-#
-# If nothing is found, we still return "powershell" so the later
-# system2() call can produce a standard "command not found" error.
-# ---------------------------------------------------------------------
-#' @noRd
 .casd_find_powershell <- function() {
   for (exe in c("powershell.exe", "pwsh.exe", "powershell", "pwsh")) {
     path <- unname(Sys.which(exe))
@@ -292,21 +125,6 @@ CASD_DISABLED_CREDENTIALS <- c(
   "powershell"
 }
 
-# ---------------------------------------------------------------------
-# Internal helper: parse and validate a network port
-# ---------------------------------------------------------------------
-#
-# Accepts:
-# - numeric ports: 7077
-# - character ports: "7077"
-#
-# Returns:
-# - integer port if valid
-# - NULL if missing/invalid
-#
-# Valid range: 1 to 65535, because blockManagerPort is driver_port+max_user_count
-# ---------------------------------------------------------------------
-#' @noRd
 .casd_parse_port <- function(x) {
   # Missing input.
   if (is.null(x) || length(x) == 0L) return(NULL)
@@ -329,34 +147,6 @@ CASD_DISABLED_CREDENTIALS <- c(
 }
 
 
-# =====================================================================
-# Read CASD configuration from Windows registry
-# =====================================================================
-#
-# Expected registry location:
-#
-#   HKEY_CURRENT_USER\Software\CASD\Hadoop
-#
-# Expected values inside that key:
-#
-#   ToolsPath   Required. Folder containing refresh-tokens.ps1.
-#   SparkHome   Optional. SPARK_HOME.
-#   HadoopConf  Optional. HADOOP_CONF_DIR.
-#   DriverPort  Optional. Default Spark driver port.
-#
-# Return value:
-#
-#   list(
-#     ToolsPath = "...",
-#     SparkHome = "...",
-#     HadoopConf = "...",
-#     DriverPort = "..."
-#   )
-#
-# Missing optional values are returned as NA_character_.
-# =====================================================================
-#' @return A list containing Hadoop and Spark configurations.
-#' @noRd
 get_casd_conf <- function() {
   # This helper is Windows-only because it uses readRegistry().
   if (!.casd_is_windows()) {
@@ -403,35 +193,6 @@ get_casd_conf <- function() {
 }
 
 
-# =====================================================================
-# Generate an ephemeral Hadoop delegation token file
-# =====================================================================
-#
-# This function:
-#
-# 1. Reads CASD config.
-# 2. Finds refresh-tokens.ps1.
-# 3. Creates a temporary output path.
-# 4. Runs PowerShell:
-#
-#      refresh-tokens.ps1 -Out <tempfile> -Quiet
-#
-# 5. Confirms that the token file was created and is not empty.
-# 6. Sets HADOOP_TOKEN_FILE_LOCATION.
-# 7. Saves the token path in .casd_state for later cleanup.
-#
-# Return value:
-#
-#   Normalized path to the generated token file.
-#
-# Side effects:
-#
-#   - Creates a temp token file.
-#   - Sets HADOOP_TOKEN_FILE_LOCATION.
-#   - Updates .casd_state.
-# =====================================================================
-#' @return The normalized file path to the generated token.
-#' @noRd
 generate_casd_token <- function() {
   # Load CASD configuration from registry.
   cf <- get_casd_conf()
@@ -453,15 +214,6 @@ generate_casd_token <- function() {
     mustWork = FALSE
   )
 
-  # -------------------------------------------------------------------
-  # Failure cleanup for token generation
-  # -------------------------------------------------------------------
-  #
-  # If token generation fails, we may have created a partial token file
-  # or CRC file. This on.exit() hook removes them.
-  #
-  # success is set to TRUE only at the very end.
-  # -------------------------------------------------------------------
   success <- FALSE
 
   on.exit({
@@ -475,20 +227,6 @@ generate_casd_token <- function() {
     }
   }, add = TRUE)
 
-  # PowerShell arguments.
-  #
-  # -NoProfile: Not used for now
-  #   Avoid loading user PowerShell profiles, making execution faster
-  #   and more predictable.
-  #
-  # -NonInteractive:
-  #   Fail instead of prompting the user.
-  #
-  # -ExecutionPolicy Bypass:
-  #   Run the script even if the default policy is restrictive.
-  #
-  # shQuote():
-  #   Required because paths may contain spaces.
   ps_args <- c(
     "-NonInteractive",
     "-ExecutionPolicy", "Bypass",
@@ -515,16 +253,10 @@ generate_casd_token <- function() {
     stderr = TRUE
   )
 
-  # Older R versions may not support timeout.
-  # Add it only if available.
   if ("timeout" %in% names(formals(system2))) {
     sys_args$timeout <- timeout
   }
 
-  # Run PowerShell.
-  #
-  # stdout = TRUE and stderr = TRUE capture output as an R character
-  # vector, which is useful for error reporting.
   out <- tryCatch(
     suppressWarnings(do.call(system2, sys_args)),
     error = function(e) {
@@ -573,15 +305,6 @@ generate_casd_token <- function() {
     )
   }
 
-  # -------------------------------------------------------------------
-  # Preserve original HADOOP_TOKEN_FILE_LOCATION
-  # -------------------------------------------------------------------
-  #
-  # If the user already had HADOOP_TOKEN_FILE_LOCATION set, we save it
-  # once so we can restore it later.
-  #
-  # If it was blank, we store NA_character_ to mean "unset it later".
-  # -------------------------------------------------------------------
   if (!isTRUE(.casd_state$has_original_token_env)) {
     old_env <- Sys.getenv("HADOOP_TOKEN_FILE_LOCATION")
 
@@ -611,21 +334,6 @@ generate_casd_token <- function() {
   invisible(dt_path)
 }
 
-# =====================================================================
-# Clean up one token file
-# =====================================================================
-#
-# This function:
-#
-# 1. Deletes the token file.
-# 2. Deletes the matching Hadoop CRC file if present.
-# 3. Removes the token from .casd_state$tokens.
-# 4. Updates .casd_state$last_token if needed.
-# 5. Restores or unsets HADOOP_TOKEN_FILE_LOCATION.
-#
-# If token_path is NULL, it cleans the most recent token.
-# =====================================================================
-#' @noRd
 .casd_cleanup_token <- function(token_path = NULL) {
 
   # Default to the last generated token.
@@ -671,22 +379,6 @@ generate_casd_token <- function() {
   if (identical(.casd_state$last_token, token_path)) {
     .casd_state$last_token <- NULL
   }
-  # -------------------------------------------------------------------
-  # Restore HADOOP_TOKEN_FILE_LOCATION
-  # -------------------------------------------------------------------
-  #
-  # We only change the environment variable if it currently points to
-  # the token we just deleted.
-  #
-  # Cases:
-  #
-  # 1. Other CASD tokens still exist:
-  #      Point HADOOP_TOKEN_FILE_LOCATION to one remaining token.
-  #
-  # 2. No CASD tokens remain:
-  #      Restore original user value if we saved one.
-  #      If original was blank, unset the variable.
-  # -------------------------------------------------------------------
   current_env <- Sys.getenv("HADOOP_TOKEN_FILE_LOCATION")
 
   if (nzchar(current_env)) {
@@ -753,39 +445,6 @@ generate_casd_token <- function() {
 }
 
 
-# =====================================================================
-# Connect to Spark in the CASD environment
-# =====================================================================
-#
-# Main user-facing function.
-#
-# What it does:
-#
-# 1. Checks that sparklyr is installed.
-# 2. Reads CASD configuration from registry.
-# 3. Optionally fills SPARK_HOME and HADOOP_CONF_DIR.
-# 4. Builds sparklyr config.
-# 5. Disables selected Spark credential providers.
-# 6. Resolves driver port.
-# 7. If master is YARN:
-#      generates delegation token.
-# 8. Calls sparklyr::spark_connect().
-# 9. Attaches token path to the returned connection object.
-#
-# Return value:
-#
-#   sparklyr connection object.
-#
-# Important:
-#
-#   If spark_connect() fails, the generated token is cleaned up.
-# =====================================================================
-#' @param config Optional sparklyr configuration object.
-#' @param master Spark master URL (default: "yarn").
-#' @param app_name Name of the Spark application.
-#' @param driver_port Integer specifying the Spark driver port.
-#' @return A sparklyr connection object.
-#' @export
 casd_spark_connect <- function(config = NULL,
                                master = "yarn",
                                app_name = "rstudio",
@@ -812,33 +471,9 @@ casd_spark_connect <- function(config = NULL,
   # Read CASD registry configuration.
   cf <- get_casd_conf()
 
-  # Safely set environment variables only if they exist and are valid strings
-  # -------------------------------------------------------------------
-  # Environment configuration
-  # -------------------------------------------------------------------
-  #
-  # By default, we only set these if blank.
-  #
-  # If you want registry values to override existing values, replace:
-  #
-  #   .casd_set_env_if_blank(...)
-  #
-  # with:
-  #
-  #   if (!is.na(cf$SparkHome) && nzchar(cf$SparkHome)) {
-  #     Sys.setenv(SPARK_HOME = cf$SparkHome)
-  #   }
-  # -------------------------------------------------------------------
   .casd_set_env_if_blank("SPARK_HOME", cf$SparkHome)
   .casd_set_env_if_blank("HADOOP_CONF_DIR", cf$HadoopConf)
 
-  # -------------------------------------------------------------------
-  # Build Spark config
-  # -------------------------------------------------------------------
-  #
-  # If user did not provide config, start from sparklyr::spark_config().
-  # Otherwise, use the user-provided config list.
-  # -------------------------------------------------------------------
   cfg <- if (is.null(config)) sparklyr::spark_config() else config
 
   if (!is.list(cfg)) {
@@ -848,36 +483,12 @@ casd_spark_connect <- function(config = NULL,
     )
   }
 
-  # -------------------------------------------------------------------
-  # CASD security constraints
-  # -------------------------------------------------------------------
-  #
-  # We rely on manually provided delegation
-  # tokens. The below settings prevent Spark from trying to generate other
-  # credential tokens automatically.
-  # -------------------------------------------------------------------
   cfg$spark.security.credentials.hadoopfs.enabled <- "false"
   cfg$spark.security.credentials.hive.enabled     <- "false"
   cfg$spark.security.credentials.hbase.enabled    <- "false"
 
-  # -------------------------------------------------------------------
-  # Driver port resolution
-  # -------------------------------------------------------------------
-  #
-  # Precedence:
-  #
-  # 1. Explicit driver_port argument.
-  # 2. Existing config value: spark.driver.port.
-  # 3. Registry value: DriverPort.
-  #
-  # If none are valid, no driver port is forced.
-  # This allows Spark to choose a random port.
-  # -------------------------------------------------------------------
-
-  # if driver_port is not valid, the function return a null value
   user_input_port <- .casd_parse_port(driver_port)
 
-  # If the user explicitly supplied a bad port, fail.
   # If the user explicitly supplied a bad port, fail.
   if (!.casd_is_blank(driver_port) && is.null(user_input_port)) {
     stop(
@@ -896,18 +507,6 @@ casd_spark_connect <- function(config = NULL,
     # setup driver port
     cfg[["spark.driver.port"]] <- as.character(final_driver_port)
 
-    # ---------------------------------------------------------------
-    # Block manager port
-    # ---------------------------------------------------------------
-    #
-    # Original script used:
-    #
-    #   blockManager.port = driver.port + 200
-    #
-    # We only set this if:
-    # - user/config did not already set it
-    # - the resulting port is valid
-    # ---------------------------------------------------------------
     if (.casd_is_blank(cfg[["spark.driver.blockManager.port"]])) {
       bm_port <- final_port + 200L
 
@@ -923,13 +522,7 @@ casd_spark_connect <- function(config = NULL,
     }
   }
 
-  # -------------------------------------------------------------------
-  # Token generation for YARN
-  # -------------------------------------------------------------------
-  #
-  # We only generate a token when connecting to YARN.
-  # Local or test masters usually do not need Hadoop delegation tokens.
-  # -------------------------------------------------------------------
+
   token_path <- NULL
   cleanup_on_error <- FALSE
 
@@ -949,13 +542,6 @@ casd_spark_connect <- function(config = NULL,
     )
   }
 
-  # -------------------------------------------------------------------
-  # SPARK_HOME handling
-  # -------------------------------------------------------------------
-  #
-  # If SPARK_HOME is blank, pass nothing to spark_connect().
-  # This lets sparklyr use its own default behavior.
-  # -------------------------------------------------------------------
   spark_home <- Sys.getenv("SPARK_HOME")
   if (!nzchar(spark_home)) spark_home <- NULL
 
@@ -1005,16 +591,6 @@ casd_spark_connect <- function(config = NULL,
   # Do not remove token on normal function exit.
   cleanup_on_error <- FALSE
 
-  # -------------------------------------------------------------------
-  # Attach token path to connection object
-  # -------------------------------------------------------------------
-  #
-  # This allows casd_spark_disconnect(sc) to know which token file
-  # belongs to this specific Spark connection.
-  #
-  # If attaching the attribute fails for some reason, we still return
-  # the connection object.
-  # -------------------------------------------------------------------
   if (!is.null(token_path)) {
     sc <- tryCatch(
       structure(sc, casd_token_path = token_path),
@@ -1025,31 +601,7 @@ casd_spark_connect <- function(config = NULL,
   sc
 }
 
-# =====================================================================
-# Disconnect from Spark and clean up resources
-# =====================================================================
-#
-# Main user-facing cleanup function.
-#
-# What it does:
-#
-# 1. Determines which token belongs to the connection, if possible.
-# 2. Disconnects the Spark connection if it is still open.
-# 3. Deletes the token file and CRC file.
-# 4. Restores/unsets HADOOP_TOKEN_FILE_LOCATION.
-#
-# Usage:
-#
-#   casd_spark_disconnect(sc)
-#
-# You can also call:
-#
-#   casd_spark_disconnect()
-#
-# to clean the most recent token without disconnecting a connection.
-# =====================================================================
-#' @param sc A sparklyr connection object.
-#' @export
+
 casd_spark_disconnect <- function(sc = NULL) {
 
   token_path <- NULL
@@ -1059,14 +611,6 @@ casd_spark_disconnect <- function(sc = NULL) {
     # casd_spark_connect() attached the token path to sc.
     token_path <- attr(sc, "casd_token_path", exact = TRUE)
 
-    # Fallback case:
-    #
-    # If the connection object does not carry a token attribute, and we
-    # only have one tracked token, assume that token belongs to this
-    # connection.
-    #
-    # This is intentionally conservative. If multiple tokens exist and
-    # we cannot identify the correct one, we do not guess.
     if (is.null(token_path) &&
         is.environment(.casd_state$tokens) &&
         length(ls(.casd_state$tokens)) == 1L) {
@@ -1123,25 +667,6 @@ casd_spark_disconnect <- function(sc = NULL) {
 }
 
 
-# =====================================================================
-# Clean tracked CASD token files manually
-# =====================================================================
-#
-# This is useful if:
-#
-# - you disconnected using sparklyr::spark_disconnect() directly
-# - your script created tokens but did not clean them
-# - you want to force cleanup before exiting
-#
-# Arguments:
-#
-#   all = TRUE
-#     Clean all tracked token files.
-#
-#   all = FALSE
-#     Clean only the most recent token file.
-# =====================================================================
-#' @export
 casd_cleanup_tokens <- function(all = TRUE) {
 
   if (isTRUE(all) && is.environment(.casd_state$tokens)) {
@@ -1162,24 +687,6 @@ casd_cleanup_tokens <- function(all = TRUE) {
   invisible(TRUE)
 }
 
-
-# =====================================================================
-# Finalizer: best-effort cleanup when R exits normally
-# =====================================================================
-#
-# This finalizer deletes tracked token files when the R session ends.
-#
-# Important limitations:
-#
-# - It helps for normal R shutdown.
-# - It does NOT protect against:
-#     * R crashes
-#     * Task Manager kill
-#     * power loss
-#     * kill -9 / taskkill /F
-#
-# This finalizer also does not disconnect Spark. It only cleans files.
-# =====================================================================
 reg.finalizer(
   .casd_state,
   function(env) {
