@@ -9,7 +9,7 @@ $fullCp = "$hadoopCp;target/make-creds-file-1.0.0-SNAPSHOT.jar"
 # make sure you have a valid kerberos before running this command.
 $tokenStr = "IgAHcGxpdS1hZARoZGZzAIoBn-wMxPSKAaAQGUj0jgE_j9gU6yi6RBmIDbDA2hOzqdolWkuNbAgTU1dFQkhERlMgZGVsZWdhdGlvbhAxMC41MC41LjIwMzo5MDAw"
 
-$serviceStr = "10.50.5.224:8020"
+$serviceStr = "ip:port"
 
 # 3. Execute
 java -cp $fullCp org.casd.util.MakeCredsFile `
