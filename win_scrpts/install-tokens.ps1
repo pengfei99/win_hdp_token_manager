@@ -169,7 +169,7 @@ $acl.SetAccessRuleProtection($true, $false)
 
 # Remove existing explicit access rules.
 foreach ($rule in @($acl.Access)) {
-    $acl.RemoveAccessRule($rule) | Out-Null
+    $null = $acl.RemoveAccessRule($rule)
 }
 
 $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
@@ -183,8 +183,13 @@ $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
 $acl.AddAccessRule($userRule)
 $acl.AddAccessRule($systemRule)
 
-Set-Acl -LiteralPath $tokenDir -AclObject $acl
-Write-Verbose "Hardened NTFS ACLs on: $tokenDir"
+try {
+    Set-Acl -LiteralPath $tokenDir -AclObject $acl -ErrorAction Stop
+    Write-Verbose "Hardened NTFS ACLs on: $tokenDir"
+}
+catch {
+    Write-Warning "Failed to set ACLs on $tokenDir. You may need to run as Administrator. Error: $_"
+}
 
 #endregion 1
 
@@ -280,7 +285,7 @@ $profileBeginMarker
 # -----------------------------------------------------------------------------
 Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
     try {
-        & $profileRefreshScript -Cancel -Quiet
+        & $profileRefreshScript -Cancel -Quiet -ErrorAction SilentlyContinue
     }
     catch {
         # PowerShell is exiting, do not prevent shutdown due to cleanup errors.
@@ -299,21 +304,21 @@ function global:spark-submit {
     `$jobToken = Join-Path `$env:TEMP "hadoop-job-`$PID-`$([guid]::NewGuid().ToString('N')).dt"
 
     `$oldTokenLocation = `$env:HADOOP_TOKEN_FILE_LOCATION
-    `$hadOldToken = Test-Path Env:HADOOP_TOKEN_FILE_LOCATION
+    `$hadOldToken = Test-Path -Path Env:HADOOP_TOKEN_FILE_LOCATION
+    `$localExitCode = 0
 
     try {
         # Generate an independent token for this Spark job.
-        & $profileRefreshScript -Out `$jobToken -Quiet
-        if (`$LASTEXITCODE -ne 0) {
-            Write-Error "Unable to create Spark job delegation token."
-            `$global:LASTEXITCODE = 1
-            return
+        & $profileRefreshScript -Out `$jobToken -Quiet -ErrorAction Stop
+        if (`$null -ne `$LASTEXITCODE -and `$LASTEXITCODE -ne 0) {
+            throw "Exit code `$LASTEXITCODE"
         }
 
         `$env:HADOOP_TOKEN_FILE_LOCATION = `$jobToken
 
-        # Execute spark-submit
-        & "`$env:SPARK_HOME\bin\spark-submit.cmd" @args
+        # Execute spark-submit (fallback to PATH if SPARK_HOME is missing)
+        `$sparkCmd = if (`$env:SPARK_HOME) { "`$env:SPARK_HOME\bin\spark-submit.cmd" } else { "spark-submit.cmd" }
+        & `$sparkCmd @args
 
         # Capture exit code before finally block alters it
         `$localExitCode = `$LASTEXITCODE
@@ -328,7 +333,7 @@ function global:spark-submit {
             `$env:HADOOP_TOKEN_FILE_LOCATION = `$oldTokenLocation
         }
         else {
-            Remove-Item Env:HADOOP_TOKEN_FILE_LOCATION -ErrorAction SilentlyContinue
+            Remove-Item -Path Env:HADOOP_TOKEN_FILE_LOCATION -ErrorAction SilentlyContinue
         }
 
         # Remove the temporary token and Hadoop checksum.
@@ -366,10 +371,8 @@ if ($profileContent -match $profilePattern) {
 }
 else {
     Write-Verbose "No existing CASD profile block found. Adding it."
-    if ($profileContent.Length -gt 0 -and -not $profileContent.EndsWith("`r`n")) {
-        $profileContent += "`r`n"
-    }
-    $profileContent += "`r`n" + $profileBlock.TrimEnd() + "`r`n"
+    # Ensure clean appending with proper newline separation
+    $profileContent = $profileContent.TrimEnd() + "`r`n" + $profileBlock.TrimEnd() + "`r`n"
 }
 
 try {
@@ -389,15 +392,15 @@ catch {
 
 Write-Host "Generating initial token set..." -NoNewline
 try {
-    & $refreshScript -Quiet
-    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+    & $refreshScript -Quiet -ErrorAction Stop
+    if ($null -ne $LASTEXITCODE -and $LASTEXITCODE -ne 0) {
         throw "refresh-tokens.ps1 returned exit code $LASTEXITCODE."
     }
     Write-Host " [OK]" -ForegroundColor Green
 }
 catch {
     Write-Host " [FAILED]" -ForegroundColor Red
-    Write-Warning "Initial token generation failed. You may need to run refresh-tokens.ps1 manually."
+    Write-Warning "Initial token generation failed. You may need to run refresh-tokens.ps1 manually. Error: $_"
     # Do not throw here, as the environment setup (registry/profile) was still successful.
 }
 

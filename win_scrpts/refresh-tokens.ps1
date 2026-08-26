@@ -44,6 +44,8 @@ $ErrorActionPreference = "Stop"
 # User-level registry locations for configuration and active session state tracking.
 $REG      = "HKCU:\Software\CASD\Hadoop"
 $REG_SESS = "$REG\Sessions"
+$TOKEN_GEN_JAR_NAME = "make-creds-file-1.0.0-SNAPSHOT.jar"
+$TOKEN_GEN_CLASS_NAME = "org.casd.util.MakeCredsFile"
 
 # ==============================================================================
 # LOGGING & CONSOLE OUTPUT HELPERS
@@ -98,7 +100,7 @@ function Get-HadoopConfig {
 }
 
 # Load current user configuration from registry
-$c = Get-HadoopConfig
+$confInReg = Get-HadoopConfig
 
 <#
 .SYNOPSIS
@@ -217,7 +219,7 @@ function Invoke-Sso {
     Requests a WebHDFS Delegation Token from the NameNode.
 #>
 function New-HdfsToken {
-    $endpoint = "$($c.NameNodeWeb)/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=$($c.Renewer)"
+    $endpoint = "$($confInReg.NameNodeWeb)/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=$($confInReg.Renewer)"
     $response = Invoke-Sso -Uri $endpoint
     $token = $response.Token.urlString
 
@@ -230,8 +232,8 @@ function New-HdfsToken {
     Requests a YARN Delegation Token from the Resource Manager.
 #>
 function New-RmToken {
-    $endpoint = "$($c.RmWeb)/ws/v1/cluster/delegation-token"
-    $body = @{ renewer = $c.Renewer } | ConvertTo-Json
+    $endpoint = "$($confInReg.RmWeb)/ws/v1/cluster/delegation-token"
+    $body = @{ renewer = $confInReg.Renewer } | ConvertTo-Json
     $response = Invoke-Sso -Uri $endpoint -Method "POST" -Body $body
     $token = $response.token
 
@@ -247,7 +249,7 @@ function Revoke-HdfsToken {
     param([string]$Token)
     if (-not $Token) { return }
     try {
-        $endpoint = "$($c.NameNodeWeb)/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=$Token"
+        $endpoint = "$($confInReg.NameNodeWeb)/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=$Token"
         Invoke-Sso -Uri $endpoint -Method "PUT" | Out-Null
     } catch {
         Write-LogMessage "HDFS revocation ignored: $($_.Exception.Message)" "WARNING"
@@ -262,7 +264,7 @@ function Revoke-RmToken {
     param([string]$Token)
     if (-not $Token) { return }
     try {
-        $endpoint = "$($c.RmWeb)/ws/v1/cluster/delegation-token"
+        $endpoint = "$($confInReg.RmWeb)/ws/v1/cluster/delegation-token"
         $headers  = @{ "X-Hadoop-Delegation-Token" = $Token }
         Invoke-Sso -Uri $endpoint -Method "DELETE" -Headers $headers | Out-Null
     } catch {
@@ -409,12 +411,14 @@ function Write-CredsFile {
     }
 
     # Dynamically extract Hadoop Java classpath
-    $classpath = ""
+    $hadoopCp = ""
     try {
-        $classpath = (hdfs classpath 2>$null | Out-String).Trim()
+        $hadoopCp = (hdfs classpath 2>$null | Out-String).Trim()
     } catch {
         Write-LogMessage "Could not determine Hadoop classpath via 'hdfs classpath'. Ensure Hadoop bin directory is in your system PATH." "WARNING"
     }
+    $tokenGenCp = "$confInReg.ToolsPath/$TOKEN_GEN_JAR_NAME"
+    $fullCp = "$hadoopCp;$tokenGenCp"
 
     # Temporarily unset variable to prevent recursion during MakeCredsFile run
     $savedEnv = $env:HADOOP_TOKEN_FILE_LOCATION
@@ -425,13 +429,13 @@ function Write-CredsFile {
 
     # Build arguments array to handle paths with spaces safely via Splatting
     $javaArgs = @(
-        "-cp", "$classpath;$($c.ToolsPath)",
-        "MakeCredsFile",
+        "-cp", "$fullCp",
+        "$TOKEN_GEN_CLASS_NAME",
         $DestinationPath,
-        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($c.ServiceIp):$($c.HdfsRpcPort)",
-        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($c.ServiceFqdn):$($c.HdfsRpcPort)",
-        "RM_DELEGATION_TOKEN",   $RmTok,   "$($c.ServiceIp):$($c.RmRpcPort)",
-        "RM_DELEGATION_TOKEN",   $RmTok,   "$($c.ServiceFqdn):$($c.RmRpcPort)"
+        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($confInReg.ServiceIp):$($confInReg.HdfsRpcPort)",
+        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($confInReg.ServiceFqdn):$($confInReg.HdfsRpcPort)",
+        "RM_DELEGATION_TOKEN",   $RmTok,   "$($confInReg.ServiceIp):$($confInReg.RmRpcPort)",
+        "RM_DELEGATION_TOKEN",   $RmTok,   "$($confInReg.ServiceFqdn):$($confInReg.RmRpcPort)"
     )
 
     # Invoke Java binary helper
@@ -477,12 +481,12 @@ Clear-OrphanSessions
 Remove-Session $PID
 
 # Ensure local token directory exists
-if (-not (Test-Path $c.TokenDir)) {
-    New-Item -ItemType Directory -Path $c.TokenDir -Force | Out-Null
+if (-not (Test-Path $confInReg.TokenDir)) {
+    New-Item -ItemType Directory -Path $confInReg.TokenDir -Force | Out-Null
 }
 
 # Target file path for the current process session
-$tokenFilePath = Join-Path $c.TokenDir "hadoop-$PID.dt"
+$tokenFilePath = Join-Path $confInReg.TokenDir "hadoop-$PID.dt"
 
 # Fetch fresh tokens and write Java token file
 $hdfsTok = New-HdfsToken
@@ -506,4 +510,4 @@ Set-ItemProperty -Path $sessionKey -Name "Created"   -Value $creationTime -Type 
 [Environment]::SetEnvironmentVariable("HADOOP_TOKEN_FILE_LOCATION", $tokenFilePath, "Process")
 $env:HADOOP_TOKEN_FILE_LOCATION = $tokenFilePath
 
-Write-LogMessage "Session tokens established ($env:USERNAME, renewer=$($c.Renewer)): $tokenFilePath"
+Write-LogMessage "Session tokens established ($env:USERNAME, renewer=$($confInReg.Renewer)): $tokenFilePath"
