@@ -4,14 +4,15 @@
 
 .DESCRIPTION
     This script sets up the necessary registry keys, directories, and PowerShell profile wrappers
-    to automatically manage Hadoop/YARN/Spark delegation tokens.
+    to automatically manage Hadoop/YARN/Spark delegation tokens in multi-user environments.
 
     It ensures that:
     1. A fresh session token is acquired when a new PowerShell console opens.
     2. The session token is revoked when the console closes (acting like a Kerberos logout).
-    3. Commands like `spark-submit`, `hdfs`, `yarn`, and `spark-run` are wrapped to temporarily
-       inject an ephemeral, job-specific token, protecting the main session token from being
-       accidentally exposed or reused by cluster nodes.
+    3. Commands like `hdfs` and `yarn` can use the session token natively.
+    4. Commands like `spark-submit` are wrapped to temporarily inject an ephemeral, job-specific
+       token, protecting the main session token from being accidentally exposed or reused by
+       cluster nodes.
 
 .PARAMETER NameNodeWeb
     The WebHDFS URL of the NameNode (e.g., https://deb13-spark1.casdds.casd:50470).
@@ -22,7 +23,7 @@
 .PARAMETER ServiceFqdn
     The Fully Qualified Domain Name (FQDN) of the primary service node.
 .PARAMETER Renewer
-    The principal authorized to renew the delegation tokens (default: "hdfs").
+    The principal authorized to renew delegation tokens (default: "hdfs").
 .PARAMETER HdfsRpcPort
     The RPC port for HDFS (default: 9000).
 .PARAMETER RmRpcPort
@@ -76,51 +77,134 @@ param(
 # ==============================================================================
 $ErrorActionPreference = "Stop"
 
-# return the root dir path of the install-tokens.ps1
+# Return the root dir path of the install-tokens.ps1
 $toolsDir = $PSScriptRoot
-# refresh script name
-$RefreshScriptName = "refresh-tokens.ps1"
-$registryPath    = "HKCU:\Software\CASD\Hadoop"
+# Refresh script name
+$refreshScriptName = "refresh-tokens.ps1"
+$refreshScript = Join-Path $toolsDir $refreshScriptName
+
+$registryPath = "HKCU:\Software\CASD\Hadoop"
+
+# Use CurrentUserAllHosts so the configuration is available to all PowerShell
+# hosts for the current user.
 $profilePath = $PROFILE.CurrentUserAllHosts
-$configMarker = "# === HDFS/YARN/Spark delegation tokens ==="
 
-Write-Verbose "Starting Hadoop/Spark cluster token environment configuration..."
+$profileBeginMarker = "# === HDFS/YARN/Spark delegation tokens BEGIN ==="
+$profileEndMarker   = "# === HDFS/YARN/Spark delegation tokens END ==="
+
+Write-Verbose "Starting Hadoop/Spark token environment configuration..."
+Write-Verbose "Tools directory : $toolsDir"
+Write-Verbose "Refresh script  : $refreshScript"
+Write-Verbose "Profile         : $profilePath"
+
 
 # ==============================================================================
-#region 0. Pre-flight Checks
+#region Helper functions
 # ==============================================================================
 
-$refreshScript = Join-Path $toolsDir $RefreshScriptName
+function ConvertTo-PowerShellSingleQuotedString {
+    param(
+        [Parameter(Mandatory)]
+        [string] $Value
+    )
+    # PowerShell single-quoted strings escape ' as ''
+    return "'" + ($Value -replace "'", "''") + "'"
+}
 
-if (-not (Test-Path $refreshScript)) {
-     throw "Critical dependency missing: '$RefreshScriptName' not found in directory: $toolsDir"
+#endregion Helper functions
+
+
+# ==============================================================================
+#region 0. Pre-flight checks
+# ==============================================================================
+
+if (-not (Test-Path -LiteralPath $refreshScript -PathType Leaf)) {
+    throw @"
+Critical dependency missing.
+
+Expected refresh script:
+    $refreshScript
+
+Make sure '$refreshScriptName' is located next to this setup script.
+"@
 }
 
 if ([string]::IsNullOrWhiteSpace($env:HADOOP_HOME)) {
-    Write-Warning "Environment variable 'HADOOP_HOME' is not defined. Some wrapped commands may fail."
+    Write-Warning "Environment variable HADOOP_HOME is not defined. Hadoop commands may not work."
 }
+
 if ([string]::IsNullOrWhiteSpace($env:HADOOP_CONF_DIR)) {
-    Write-Warning "Environment variable 'HADOOP_CONF_DIR' is not defined. Some wrapped commands may fail."
+    Write-Warning "Environment variable HADOOP_CONF_DIR is not defined. Hadoop commands may not work."
 }
+
 if ([string]::IsNullOrWhiteSpace($env:SPARK_HOME)) {
-    Write-Warning "Environment variable 'SPARK_HOME' is not defined. Some wrapped commands may fail."
+    Write-Warning "SPARK_HOME is not defined. spark-submit may not work."
 }
+
 #endregion 0
+
 
 # ==============================================================================
 #region 1. Registry and Directory Configuration
 # ==============================================================================
+
 $tokenDir = Join-Path $env:LOCALAPPDATA "CASD\tokens"
 
-# Ensure the token storage directory exists
-if (-not (Test-Path $tokenDir)) {
+if (-not (Test-Path -LiteralPath $tokenDir -PathType Container)) {
     New-Item -ItemType Directory -Path $tokenDir -Force | Out-Null
-    Write-Verbose "Created token storage directory: $tokenDir"
+    Write-Verbose "Created token directory: $tokenDir"
 }
 
-# Ensure the registry key exists
-if (-not (Test-Path $registryPath)) {
+# ------------------------------------------------------------------------------
+# Lock down the token directory
+# ------------------------------------------------------------------------------
+
+$currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
+$acl = Get-Acl -LiteralPath $tokenDir
+
+# Disable inheritance and remove inherited permissions.
+# 1st arg: is protected or not
+# 2nd arg: preserve inheritance or not
+$acl.SetAccessRuleProtection($true, $false)
+
+# Remove existing explicit access rules.
+foreach ($rule in @($acl.Access)) {
+    $acl.RemoveAccessRule($rule) | Out-Null
+}
+
+$userRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    $currentUser, "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+)
+
+$systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+    "NT AUTHORITY\SYSTEM", "FullControl", "ContainerInherit,ObjectInherit", "None", "Allow"
+)
+
+$acl.AddAccessRule($userRule)
+$acl.AddAccessRule($systemRule)
+
+Set-Acl -LiteralPath $tokenDir -AclObject $acl
+Write-Verbose "Hardened NTFS ACLs on: $tokenDir"
+
+#endregion 1
+
+
+# ==============================================================================
+#region 2. Registry configuration
+# ==============================================================================
+
+if (-not (Test-Path -LiteralPath $registryPath)) {
     New-Item -Path $registryPath -Force | Out-Null
+}
+
+# Prefer HADOOP_CONF_DIR if it is explicitly configured.
+# Otherwise fall back to HADOOP_HOME\etc\hadoop.
+$hadoopConfDir = ""
+if (-not [string]::IsNullOrWhiteSpace($env:HADOOP_CONF_DIR)) {
+    $hadoopConfDir = $env:HADOOP_CONF_DIR
+}
+elseif (-not [string]::IsNullOrWhiteSpace($env:HADOOP_HOME)) {
+    $hadoopConfDir = Join-Path $env:HADOOP_HOME "etc\hadoop"
 }
 
 # Define configuration properties to store in the registry
@@ -135,112 +219,202 @@ $conf = @{
     HdfsRpcPort = $HdfsRpcPort
     RmRpcPort   = $RmRpcPort
     StagingDir  = $StagingDir
-    SparkHome   = $env:SPARK_HOME
-    HadoopConf  = if ($env:HADOOP_HOME) { Join-Path $env:HADOOP_HOME "etc\hadoop" } else { "" }
+    SparkHome   = if ($env:SPARK_HOME) { $env:SPARK_HOME } else { "" }
+    HadoopHome  = if ($env:HADOOP_HOME) { $env:HADOOP_HOME } else { "" }
+    HadoopConf  = $hadoopConfDir
 }
 
 # Write or update each property in the registry
-foreach ($k in $conf.Keys) {
-    New-ItemProperty -Path $registryPath -Name $k -Value $conf[$k] -PropertyType String -Force | Out-Null
+foreach ($key in $conf.Keys) {
+    Set-ItemProperty -Path $registryPath -Name $key -Value $conf[$key] -Type String -Force
 }
 
 # DriverPort is stored as a DWord (integer)
-Set-ItemProperty -Path $registryPath -Name "DriverPort" -Value $DriverPort -PropertyType DWord -Force | Out-Null
+Set-ItemProperty -Path $registryPath -Name "DriverPort" -Value $DriverPort -Type DWord -Force
 
-New-Item -ItemType Directory -Path $tokenDir -Force | Out-Null
-
-Write-Verbose "Configuration successfully written to $registryPath"
-
-#endregion 1
-
-# ==============================================================================
-#region 2. PowerShell Profile Injection
-# ==============================================================================
-# Remove any existing wrapped functions from the current session memory to ensure a clean state
-foreach ($func in 'spark-submit', 'hdfs', 'yarn', 'spark-run') {
-    Remove-Item "Function:\$func" -ErrorAction SilentlyContinue
-}
-
-# Ensure the profile's parent directory exists (prevents errors on fresh machines)
-$profileDir = Split-Path -Parent $profilePath
-if (-not (Test-Path $profileDir)) {
-    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
-}
-if (-not (Test-Path $profilePath)) {
-    New-Item -ItemType File -Path $profilePath -Force | Out-Null
-}
-
-# Check if our configuration block is already present in the profile
-if (Select-String -Path $profilePath -Pattern $configMarker -SimpleMatch -Quiet) {
-    Write-Host "Configuration block already exists in $profilePath. Skipping injection." -ForegroundColor Yellow
-}
-else {
-    Write-Verbose "Injecting configuration block into PowerShell profile..."
-
-    # NOTE: The backtick (`) escapes the variables (e.g., `$env:TEMP`) so they are evaluated
-    # at RUNTIME when the user opens a new console, NOT at install time.
-    $profileBlock = @"
-
-$configMarker
-
-# Session Token: Acquire a fresh set of tokens every time a new console opens.
-# a global session token for all basic operations such as hdfs, yarn
-# For spark-submit we need a new token, because hadoop will revoke the token
-# after the job is finished, if we use the global token for spark-submit,
-# after the job is finished, we can not do hdfs or yarn command.
-# The old token is revoked during this process, similar to a Kerberos logon.
-& '$toolsDir\$RefreshScriptName' -Quiet
-
-# Revocation on console exit (equivalent to a logout).
-Register-EngineEvent PowerShell.Exiting -SupportEvent -Action {
-    & '$toolsDir\$RefreshScriptName' -Cancel -Quiet
-} | Out-Null
-
-# -----------------------------------------------------------------------------
-# Command Wrappers
-# These wrappers ensure a valid session token is present, and for job-submission
-# commands, they inject an ephemeral, job-specific token to protect the session.
-# -----------------------------------------------------------------------------
-
-function global:spark-submit {
-    `$jobDt = Join-Path `$env:TEMP "hadoop-job-`$PID.dt"
-    & '$toolsDir\$RefreshScriptName' -Out `$jobDt -Quiet
-
-    `$savedTokenLocation = `$env:HADOOP_TOKEN_FILE_LOCATION
-    `$env:HADOOP_TOKEN_FILE_LOCATION = `$jobDt
-    try {
-        & "`$env:SPARK_HOME\bin\spark-submit.cmd" @args
-    }
-    finally {
-         # Restore original environment and clean up ephemeral token files
-        `$env:HADOOP_TOKEN_FILE_LOCATION = `$savedTokenLocation
-        Remove-Item `$jobDt -ErrorAction SilentlyContinue
-        Remove-Item (Join-Path `$env:TEMP ".hadoop-job-`$PID.dt.crc") -ErrorAction SilentlyContinue
-    }
-}
-"@
-    # Append to profile using UTF8 encoding to prevent character corruption
-    Add-Content -Path $profilePath -Value $profileBlock -Encoding UTF8
-    Write-Host "Configuration block successfully added to $profilePath" -ForegroundColor Green
-}
+Write-Verbose "Configuration written to: $registryPath"
 
 #endregion 2
 
-# ==============================================================================
-#region 3. Initial Token Generation
-# ==============================================================================
-Write-Host "Generating initial token set..." -NoNewline
-& $refreshScript -Quiet
-Write-Host " [OK]" -ForegroundColor Green
-#endregion 3
 
 # ==============================================================================
-#region 4. Completion Message
+#region 3. PowerShell Profile Injection
 # ==============================================================================
+
+# ------------------------------------------------------------------------------
+# Ensure profile directory exists
+# ------------------------------------------------------------------------------
+
+$profileDir = Split-Path -Parent $profilePath
+if (-not (Test-Path -LiteralPath $profileDir -PathType Container)) {
+    New-Item -ItemType Directory -Path $profileDir -Force | Out-Null
+}
+
+if (-not (Test-Path -LiteralPath $profilePath -PathType Leaf)) {
+    New-Item -ItemType File -Path $profilePath -Force | Out-Null
+}
+
+# Build paths as literals for the generated profile.
+# These values are intentionally resolved NOW, during installation.
+$profileRefreshScript = ConvertTo-PowerShellSingleQuotedString $refreshScript
+
+# ------------------------------------------------------------------------------
+# Profile block
+# Note: We use an expandable here-string @" ... "@.
+# Variables prefixed with ` are escaped so they evaluate in the USER's profile, not now.
+# Variables WITHOUT backticks (like $profileRefreshScript) evaluate NOW.
+# ------------------------------------------------------------------------------
+
+$profileBlock = @"
+$profileBeginMarker
+
+# -----------------------------------------------------------------------------
+# CASD Hadoop/Spark delegation token configuration
+# -----------------------------------------------------------------------------
+
+# Acquire a fresh session token whenever PowerShell starts.
+& $profileRefreshScript -Quiet
+
+# -----------------------------------------------------------------------------
+# Revoke the session token when PowerShell exits.
+# -----------------------------------------------------------------------------
+Register-EngineEvent -SourceIdentifier PowerShell.Exiting -SupportEvent -Action {
+    try {
+        & $profileRefreshScript -Cancel -Quiet
+    }
+    catch {
+        # PowerShell is exiting, do not prevent shutdown due to cleanup errors.
+    }
+} | Out-Null
+
+# -----------------------------------------------------------------------------
+# spark-submit wrapper
+#
+# spark-submit receives its own temporary delegation token.
+# The normal session token is restored after spark-submit terminates.
+# -----------------------------------------------------------------------------
+
+function global:spark-submit {
+    # Sub-expression that: Creates a new GUID and formats it as 32 hex digits with no hyphens (N format specifier)
+    `$jobToken = Join-Path `$env:TEMP "hadoop-job-`$PID-`$([guid]::NewGuid().ToString('N')).dt"
+
+    `$oldTokenLocation = `$env:HADOOP_TOKEN_FILE_LOCATION
+    `$hadOldToken = Test-Path Env:HADOOP_TOKEN_FILE_LOCATION
+
+    try {
+        # Generate an independent token for this Spark job.
+        & $profileRefreshScript -Out `$jobToken -Quiet
+        if (`$LASTEXITCODE -ne 0) {
+            Write-Error "Unable to create Spark job delegation token."
+            `$global:LASTEXITCODE = 1
+            return
+        }
+
+        `$env:HADOOP_TOKEN_FILE_LOCATION = `$jobToken
+
+        # Execute spark-submit
+        & "`$env:SPARK_HOME\bin\spark-submit.cmd" @args
+
+        # Capture exit code before finally block alters it
+        `$localExitCode = `$LASTEXITCODE
+    }
+    catch {
+        Write-Error "Failed to execute spark-submit: `$_"
+        `$localExitCode = 1
+    }
+    finally {
+        # Restore the previous token environment.
+        if (`$hadOldToken) {
+            `$env:HADOOP_TOKEN_FILE_LOCATION = `$oldTokenLocation
+        }
+        else {
+            Remove-Item Env:HADOOP_TOKEN_FILE_LOCATION -ErrorAction SilentlyContinue
+        }
+
+        # Remove the temporary token and Hadoop checksum.
+        Remove-Item -LiteralPath `$jobToken -Force -ErrorAction SilentlyContinue
+        Remove-Item -LiteralPath "`$jobToken.crc" -Force -ErrorAction SilentlyContinue
+
+        # Ensure the global exit code reflects the command's outcome
+        `$global:LASTEXITCODE = `$localExitCode
+    }
+}
+
+$profileEndMarker
+"@
+
+# ------------------------------------------------------------------------------
+# Check user profile content, if the CASD block exists already and not equal to the latest version,
+# replace it with the latest version. If no CASD block, add the latest version.
+#
+# This makes the installer idempotent and allows future versions of this
+# setup script to update the profile configuration.
+# ------------------------------------------------------------------------------
+
+$profileContent = Get-Content -LiteralPath $profilePath -Raw -ErrorAction SilentlyContinue
+if ($null -eq $profileContent) {
+    $profileContent = ""
+}
+
+$escapedBegin = [regex]::Escape($profileBeginMarker)
+$escapedEnd   = [regex]::Escape($profileEndMarker)
+$profilePattern = "(?s)$escapedBegin.*?$escapedEnd"
+
+if ($profileContent -match $profilePattern) {
+    Write-Verbose "Existing CASD profile block found. Replacing it."
+    $profileContent = [regex]::Replace($profileContent, $profilePattern, $profileBlock.TrimEnd())
+}
+else {
+    Write-Verbose "No existing CASD profile block found. Adding it."
+    if ($profileContent.Length -gt 0 -and -not $profileContent.EndsWith("`r`n")) {
+        $profileContent += "`r`n"
+    }
+    $profileContent += "`r`n" + $profileBlock.TrimEnd() + "`r`n"
+}
+
+try {
+    Set-Content -LiteralPath $profilePath -Value $profileContent -Encoding UTF8 -Force
+    Write-Verbose "PowerShell profile updated: $profilePath"
+}
+catch {
+    Write-Error "Failed to write to PowerShell profile: $_"
+}
+
+#endregion 3
+
+
+# ==============================================================================
+#region 4. Initial token generation
+# ==============================================================================
+
+Write-Host "Generating initial token set..." -NoNewline
+try {
+    & $refreshScript -Quiet
+    if ($LASTEXITCODE -and $LASTEXITCODE -ne 0) {
+        throw "refresh-tokens.ps1 returned exit code $LASTEXITCODE."
+    }
+    Write-Host " [OK]" -ForegroundColor Green
+}
+catch {
+    Write-Host " [FAILED]" -ForegroundColor Red
+    Write-Warning "Initial token generation failed. You may need to run refresh-tokens.ps1 manually."
+    # Do not throw here, as the environment setup (registry/profile) was still successful.
+}
+
+#endregion 4
+
+
+# ==============================================================================
+#region 5. Completion Message
+# ==============================================================================
+
 Write-Host ""
 Write-Host "Token configuration completed successfully." -ForegroundColor Green
+Write-Host ""
 Write-Host "Please open a NEW PowerShell console for the changes to take effect."
+Write-Host ""
 Write-Host "Once opened, you can test the configuration with:"
 Write-Host "    hdfs dfs -ls /"
+Write-Host "    yarn application -list"
 Write-Host "    spark-submit --deploy-mode cluster --master yarn my_job.py"
-#endregion4
+#endregion 5
