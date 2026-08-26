@@ -70,19 +70,21 @@ function Write-LogMessage {
 # Enforce strong TLS encryption (TLS 1.2 / TLS 1.3).
 [Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
 
-# Cluster CA certificates MUST be deployed to the Windows Trusted Root Store. Todo, for now we trust all.
+# Cluster CA certificates MUST be deployed to the Windows Trusted Root Store.
+# TODO: Remove this block and rely on OS trust store in production.
 if (-not ("TrustAllCerts" -as [type])) {
-Add-Type @"
-using System.Net;
-public static class TrustAllCerts {
-    public static void Enable() {
-        ServicePointManager.ServerCertificateValidationCallback = (s, cert, chain, errors) => true;
+    Add-Type @"
+    using System.Net;
+    using System.Security.Cryptography.X509Certificates;
+    public static class TrustAllCerts {
+        public static void Enable() {
+            ServicePointManager.ServerCertificateValidationCallback = (sender, cert, chain, errors) => true;
+        }
     }
-}
 "@
 }
 [TrustAllCerts]::Enable()
-
+# Write-LogMessage "WARNING: Server certificate validation is currently disabled (TrustAllCerts). This is a security risk." "WARNING"
 
 <#
 .SYNOPSIS
@@ -115,12 +117,17 @@ function Protect-TokenFile {
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
     try {
-        # Instantiate ACL object and disable inheritance ($true), discarding inherited rules ($false)
-        $acl = Get-Acl $FilePath
+        # Instantiate ACL object
+        $acl = Get-Acl $filePath
+
+        # Disable inheritance and remove inherited rules
         $acl.SetAccessRuleProtection($true, $false)
 
-        # Clear existing explicit rules to ensure a clean slate before adding new ones
-        $acl.Access | ForEach-Object { $acl.RemoveAccessRule($_) | Out-Null }
+        # Safely remove existing explicit rules (copy to array to avoid collection modification during enumeration)
+        $explicitRules = @($acl.Access | Where-Object { -not $_.IsInherited })
+        foreach ($rule in $explicitRules) {
+            $acl.RemoveAccessRule($rule) | Out-Null
+        }
 
         # Define explicit access rules
         $accessRuleUser   = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, "FullControl", "Allow")
@@ -130,9 +137,9 @@ function Protect-TokenFile {
         $acl.AddAccessRule($accessRuleSystem)
 
         # Apply hardened ACL back to the file
-        Set-Acl -Path $FilePath -AclObject $acl
+        Set-Acl -Path $filePath -AclObject $acl
     } catch {
-        Write-LogMessage "Failed to apply NTFS permissions to $FilePath : $($_.Exception.Message)" "WARNING"
+        Write-LogMessage "Failed to apply NTFS permissions to $filePath : $($_.Exception.Message)" "WARNING"
     }
 }
 
@@ -171,23 +178,29 @@ function Invoke-Sso {
         if ($_.Exception.Response) {
             try {
                 $responseBody = ""
+                # PS 7+ / HttpResponseMessage
+                if ($_.Exception.Response.GetType().Name -eq "HttpResponseMessage" -and $_.Exception.Response.Content) {
+                    $responseBody = $_.Exception.Response.Content.ReadAsStringAsync().Result
+                }
                 # PS 5.1 / WebException
-                if ($_.Exception.Response.GetResponseStream) {
+                elseif ($_.Exception.Response.GetResponseStream) {
                     $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
                     $reader.BaseStream.Position = 0
                     $reader.DiscardBufferedData()
                     $responseBody = $reader.ReadToEnd()
-                }
-                # PS 7+ / HttpResponseMessage
-                elseif ($_.Exception.Response.Content -and $_.Exception.Response.Content.ReadAsStringAsync) {
-                    $responseBody = $_.Exception.Response.Content.ReadAsStringAsync().Result
+                    $reader.Close()
                 }
 
-                if ($responseBody) {
-                    $errorMessage = "HTTP $($_.Exception.Response.StatusCode) - $responseBody"
+                # Fallback to built-in ErrorDetails if stream reading yields nothing
+                if ([string]::IsNullOrWhiteSpace($responseBody) -and $_.ErrorDetails.Message) {
+                    $responseBody = $_.ErrorDetails.Message
+                }
+
+                if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+                    $errorMessage = "HTTP $($_.Exception.Response.StatusCode.value__) - $responseBody"
                 }
             } catch {
-                # Fallback if stream reading fails
+                # Fallback if stream reading fails, keep original errorMessage
             }
         }
 
@@ -338,7 +351,9 @@ function Clear-OrphanSessions {
                 # If the process started AFTER the registry entry was created, it's a new process
                 # that reused the old PID, meaning the original session is dead (orphaned).
                 if ($session.Created) {
-                    $regTime = [datetime]::Parse($session.Created)
+                    # Use InvariantCulture to prevent parsing failures on non-EN-US systems
+                    $regTime = [datetime]::Parse($session.Created, [System.Globalization.CultureInfo]::InvariantCulture)
+
                     # Allow a small buffer (e.g., 5 seconds) for clock skew or process startup time
                     if ($proc.StartTime -gt $regTime.AddSeconds(5)) {
                         $isOrphan = $true
@@ -350,6 +365,7 @@ function Clear-OrphanSessions {
                 }
             }
         } catch {
+            # If we can't inspect the process (e.g., access denied), assume it's an orphan to be safe
             $isOrphan = $true
         }
 
@@ -387,12 +403,17 @@ function Write-CredsFile {
         [string]$RmTok
     )
 
+    # Verify Java is available
+    if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
+        throw "Java executable not found in system PATH. Please install Java or update PATH."
+    }
+
     # Dynamically extract Hadoop Java classpath
     $classpath = ""
     try {
         $classpath = (hdfs classpath 2>$null | Out-String).Trim()
     } catch {
-        Write-LogMessage "Could not determine Hadoop classpath. Ensure 'hdfs' is in your system PATH." "WARNING"
+        Write-LogMessage "Could not determine Hadoop classpath via 'hdfs classpath'. Ensure Hadoop bin directory is in your system PATH." "WARNING"
     }
 
     # Temporarily unset variable to prevent recursion during MakeCredsFile run
@@ -415,7 +436,6 @@ function Write-CredsFile {
 
     # Invoke Java binary helper
     $output = & java @javaArgs 2>&1
-
     $exitCode = $LASTEXITCODE
 
     # Restore previous preference states
@@ -433,7 +453,7 @@ function Write-CredsFile {
     }
 
     if ($exitCode -ne 0) { throw "MakeCredsFile failed with exit code $exitCode" }
-    if (-not (Test-Path $DestinationPath)) { throw "Target file $DestinationPath was not created." }
+    if (-not (Test-Path $DestinationPath)) { throw "Target file $DestinationPath was not created by Java helper." }
 
     # Lock down file permissions immediately after creation
     Protect-TokenFile $DestinationPath
@@ -476,12 +496,14 @@ Set-ItemProperty -Path $sessionKey -Name "TokenFile" -Value $tokenFilePath -Type
 Set-ItemProperty -Path $sessionKey -Name "HdfsToken" -Value $hdfsTok       -Type String -Force
 Set-ItemProperty -Path $sessionKey -Name "RmToken"   -Value $rmTok         -Type String -Force
 
-# Store creation time to detect PID reuse in orphan cleanup
+# Store creation time to detect PID reuse in orphan cleanup (using Round-trip format)
 $creationTime = (Get-Date).ToString("o")
 Set-ItemProperty -Path $sessionKey -Name "Created"   -Value $creationTime -Type String -Force
 
 # Export environment variable for child processes (R, Python, Spark, etc.)
-[Environment]::SetEnvironmentVariable("HADOOP_TOKEN_FILE_LOCATION", $tokenFilePath, "User")
+# CRITICAL FIX: Use "Process" scope, not "User". "User" persists across reboots and
+# will point to a deleted PID-specific file on the next login, causing Hadoop client failures.
+[Environment]::SetEnvironmentVariable("HADOOP_TOKEN_FILE_LOCATION", $tokenFilePath, "Process")
 $env:HADOOP_TOKEN_FILE_LOCATION = $tokenFilePath
 
 Write-LogMessage "Session tokens established ($env:USERNAME, renewer=$($c.Renewer)): $tokenFilePath"
