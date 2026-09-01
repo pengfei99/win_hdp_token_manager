@@ -38,8 +38,9 @@ param(
     [switch] $Quiet
 )
 
-# Enforce strict error handling for the main execution flow.
+# Enforce strict error handling and variable checking
 $ErrorActionPreference = "Stop"
+Set-StrictMode -Version Latest
 
 # User-level registry locations for configuration and active session state tracking.
 $REG      = "HKCU:\Software\CASD\Hadoop"
@@ -54,6 +55,9 @@ $TOKEN_GEN_CLASS_NAME = "org.casd.util.MakeCredsFile"
 function Write-LogMessage {
     param([string]$Message, [string]$Level = "INFO")
 
+    # Always send to verbose stream for pipeline/transcript compatibility
+    Write-Verbose "[$Level] $Message"
+
     if ($Quiet) { return }
 
     switch ($Level) {
@@ -61,8 +65,6 @@ function Write-LogMessage {
         "WARNING" { Write-Host "[WARN]  $Message" -ForegroundColor Yellow }
         default   { Write-Host "[INFO]  $Message" -ForegroundColor Cyan }
     }
-    # Also send to verbose stream for pipeline compatibility
-    Write-Verbose $Message
 }
 
 # ==============================================================================
@@ -70,7 +72,11 @@ function Write-LogMessage {
 # ==============================================================================
 
 # Enforce strong TLS encryption (TLS 1.2 / TLS 1.3).
-[Net.ServicePointManager]::SecurityProtocol = [Net.SecurityProtocolType]::Tls12 -bor [Net.SecurityProtocolType]::Tls13
+# TLS 1.3 enum (12288) is not available on older .NET Framework versions (< 4.8).
+# Use the raw integer value so this works on PS 5.1 across all Windows Server versions.
+$Tls12 = [Net.SecurityProtocolType]::Tls12
+$Tls13 = [Net.SecurityProtocolType]12288
+[Net.ServicePointManager]::SecurityProtocol = $Tls12 -bor $Tls13
 
 # Cluster CA certificates MUST be deployed to the Windows Trusted Root Store.
 # TODO: Remove this block and rely on OS trust store in production.
@@ -131,9 +137,12 @@ function Protect-TokenFile {
             $acl.RemoveAccessRule($rule) | Out-Null
         }
 
-        # Define explicit access rules
-        $accessRuleUser   = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, "FullControl", "Allow")
-        $accessRuleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", "FullControl", "Allow")
+        # Define explicit access rules using Enums to prevent localization bugs on non-English Windows
+        $fsRights = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $acType   = [System.Security.AccessControl.AccessControlType]::Allow
+
+        $accessRuleUser   = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, $fsRights, $acType)
+        $accessRuleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", $fsRights, $acType)
 
         $acl.AddAccessRule($accessRuleUser)
         $acl.AddAccessRule($accessRuleSystem)
@@ -165,7 +174,6 @@ function Invoke-Sso {
         Uri                   = $Uri
         Method                = $Method
         UseDefaultCredentials = $true  # Uses logged-in Windows user Kerberos ticket
-        SkipHttpErrorCheck    = $false
     }
 
     if ($Body)    { $params.Body = $Body; $params.ContentType = "application/json" }
@@ -175,35 +183,32 @@ function Invoke-Sso {
         return (Invoke-RestMethod @params)
     } catch {
         $errorMessage = $_.Exception.Message
+        $statusCode = $null
 
-        # Robust error extraction for both PS 5.1 (WebException) and PS 7+ (HttpResponseException)
         if ($_.Exception.Response) {
+            $statusCode = [int]$_.Exception.Response.StatusCode
+        }
+
+        # PowerShell natively populates ErrorDetails.Message with the HTTP response body
+        # for both PS 5.1 (WebException) and PS 7+ (HttpResponseException).
+        $responseBody = $_.ErrorDetails.Message
+
+        # Fallback for PS 5.1 if ErrorDetails is empty but stream is available
+        if ([string]::IsNullOrWhiteSpace($responseBody) -and $_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
             try {
-                $responseBody = ""
-                # PS 7+ / HttpResponseMessage
-                if ($_.Exception.Response.GetType().Name -eq "HttpResponseMessage" -and $_.Exception.Response.Content) {
-                    $responseBody = $_.Exception.Response.Content.ReadAsStringAsync().Result
-                }
-                # PS 5.1 / WebException
-                elseif ($_.Exception.Response.GetResponseStream) {
-                    $reader = New-Object System.IO.StreamReader($_.Exception.Response.GetResponseStream())
-                    $reader.BaseStream.Position = 0
-                    $reader.DiscardBufferedData()
-                    $responseBody = $reader.ReadToEnd()
-                    $reader.Close()
-                }
-
-                # Fallback to built-in ErrorDetails if stream reading yields nothing
-                if ([string]::IsNullOrWhiteSpace($responseBody) -and $_.ErrorDetails.Message) {
-                    $responseBody = $_.ErrorDetails.Message
-                }
-
-                if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
-                    $errorMessage = "HTTP $($_.Exception.Response.StatusCode.value__) - $responseBody"
-                }
+                $stream = $_.Exception.Response.GetResponseStream()
+                $reader = New-Object System.IO.StreamReader($stream)
+                $responseBody = $reader.ReadToEnd()
+                $reader.Close()
             } catch {
-                # Fallback if stream reading fails, keep original errorMessage
+                # Ignore stream read errors and fall back to original message
             }
+        }
+
+        if (-not [string]::IsNullOrWhiteSpace($responseBody)) {
+            $errorMessage = "HTTP $statusCode - $responseBody"
+        } elseif ($statusCode) {
+            $errorMessage = "HTTP $statusCode - $errorMessage"
         }
 
         throw "REST Call Failure [$Method $Uri]: $errorMessage"
@@ -219,11 +224,16 @@ function Invoke-Sso {
     Requests a WebHDFS Delegation Token from the NameNode.
 #>
 function New-HdfsToken {
-    $endpoint = "$($confInReg.NameNodeWeb)/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=$($confInReg.Renewer)"
+    $nnWeb = $confInReg.NameNodeWeb.TrimEnd('/')
+    $endpoint = "$nnWeb/webhdfs/v1/?op=GETDELEGATIONTOKEN&renewer=$($confInReg.Renewer)"
     $response = Invoke-Sso -Uri $endpoint
-    $token = $response.Token.urlString
 
-    if (-not $token) { throw "Empty HDFS token returned by NameNode." }
+    $token = $null
+    if ($response -and $response.Token) {
+        $token = $response.Token.urlString
+    }
+
+    if (-not $token) { throw "Empty or malformed HDFS token returned by NameNode." }
     return $token
 }
 
@@ -232,12 +242,17 @@ function New-HdfsToken {
     Requests a YARN Delegation Token from the Resource Manager.
 #>
 function New-RmToken {
-    $endpoint = "$($confInReg.RmWeb)/ws/v1/cluster/delegation-token"
+    $rmWeb = $confInReg.RmWeb.TrimEnd('/')
+    $endpoint = "$rmWeb/ws/v1/cluster/delegation-token"
     $body = @{ renewer = $confInReg.Renewer } | ConvertTo-Json
     $response = Invoke-Sso -Uri $endpoint -Method "POST" -Body $body
-    $token = $response.token
 
-    if (-not $token) { throw "Empty Resource Manager token returned." }
+    $token = $null
+    if ($response -and $response.token) {
+        $token = $response.token
+    }
+
+    if (-not $token) { throw "Empty or malformed Resource Manager token returned." }
     return $token
 }
 
@@ -249,7 +264,8 @@ function Revoke-HdfsToken {
     param([string]$Token)
     if (-not $Token) { return }
     try {
-        $endpoint = "$($confInReg.NameNodeWeb)/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=$Token"
+        $nnWeb = $confInReg.NameNodeWeb.TrimEnd('/')
+        $endpoint = "$nnWeb/webhdfs/v1/?op=CANCELDELEGATIONTOKEN&token=$Token"
         Invoke-Sso -Uri $endpoint -Method "PUT" | Out-Null
     } catch {
         Write-LogMessage "HDFS revocation ignored: $($_.Exception.Message)" "WARNING"
@@ -264,7 +280,8 @@ function Revoke-RmToken {
     param([string]$Token)
     if (-not $Token) { return }
     try {
-        $endpoint = "$($confInReg.RmWeb)/ws/v1/cluster/delegation-token"
+        $rmWeb = $confInReg.RmWeb.TrimEnd('/')
+        $endpoint = "$rmWeb/ws/v1/cluster/delegation-token"
         $headers  = @{ "X-Hadoop-Delegation-Token" = $Token }
         Invoke-Sso -Uri $endpoint -Method "DELETE" -Headers $headers | Out-Null
     } catch {
@@ -387,7 +404,7 @@ function Clear-OrphanSessions {
 if ($Cancel) {
     Remove-Session $PID
     Write-LogMessage "Tokens for current session PID $PID revoked."
-    return
+    exit 0
 }
 
 # ==============================================================================
@@ -404,21 +421,61 @@ function Write-CredsFile {
         [string]$HdfsTok,
         [string]$RmTok
     )
+    # ========================================================================
+    # Bypass polluted system PATH by using explicit environment variables
+    # ========================================================================
 
     # Verify Java is available
     if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
         throw "Java executable not found in system PATH. Please install Java or update PATH."
     }
 
-    # Dynamically extract Hadoop Java classpath
-    $hadoopCp = ""
-    try {
-        $hadoopCp = (hdfs classpath 2>$null | Out-String).Trim()
-    } catch {
-        Write-LogMessage "Could not determine Hadoop classpath via 'hdfs classpath'. Ensure Hadoop bin directory is in your system PATH." "WARNING"
+    # 1. Locate Java executable explicitly
+    $javaBaseDir = $env:JAVA_HOME
+    if ([string]::IsNullOrWhiteSpace($javaBaseDir)) {
+        $javaBaseDir = $env:JAVA_PATH # Fallback if JAVA_PATH is used instead
     }
-    $tokenGenCp = "$confInReg.ToolsPath/$TOKEN_GEN_JAR_NAME"
-    $fullCp = "$hadoopCp;$tokenGenCp"
+    if ([string]::IsNullOrWhiteSpace($javaBaseDir)) {
+        throw "Neither JAVA_HOME nor JAVA_PATH environment variables are set. Cannot locate Java executable."
+    }
+
+    $javaExe = Join-Path $javaBaseDir "bin\java.exe"
+
+    if (-not (Test-Path -LiteralPath $javaExe -PathType Leaf)) {
+        throw "Java executable not found at expected path: '$javaExe'. Please verify your JAVA_HOME or JAVA_PATH environment variable."
+    }
+
+     # 2. Locate HDFS command explicitly to get the classpath
+    $hadoopCp = ""
+    $hdfsCmd = $null
+
+    if (-not [string]::IsNullOrWhiteSpace($env:HADOOP_HOME)) {
+        $hdfsCmd = Join-Path $env:HADOOP_HOME "bin\hdfs.cmd"
+    }
+
+    if ($hdfsCmd -and (Test-Path -LiteralPath $hdfsCmd -PathType Leaf)) {
+        try {
+            # Use the explicit path to hdfs.cmd
+            $hadoopCp = (& $hdfsCmd classpath 2>$null | Out-String).Trim()
+        } catch {
+            Write-LogMessage "Could not determine Hadoop classpath via explicit HADOOP_HOME path." "WARNING"
+        }
+    } elseif (Get-Command hdfs -ErrorAction SilentlyContinue) {
+        # Fallback to PATH only if HADOOP_HOME isn't set
+        try {
+            $hadoopCp = (hdfs classpath 2>$null | Out-String).Trim()
+        } catch {
+            Write-LogMessage "Could not determine Hadoop classpath via 'hdfs classpath'." "WARNING"
+        }
+    } else {
+        Write-LogMessage "'hdfs' command not found. Skipping Hadoop classpath injection." "WARNING"
+    }
+
+    $tokenGenCp = Join-Path $confInReg.ToolsPath $TOKEN_GEN_JAR_NAME
+
+    # Filter out empty strings to prevent malformed classpaths (e.g., ";C:\path\to\jar")
+    $cpParts = @($hadoopCp, $tokenGenCp) | Where-Object { -not [string]::IsNullOrWhiteSpace($_) }
+    $fullCp = $cpParts -join ";"
 
     # Temporarily unset variable to prevent recursion during MakeCredsFile run
     $savedEnv = $env:HADOOP_TOKEN_FILE_LOCATION
@@ -427,37 +484,41 @@ function Write-CredsFile {
     $savedEap = $ErrorActionPreference
     $ErrorActionPreference = "Continue"
 
-    # Build arguments array to handle paths with spaces safely via Splatting
-    $javaArgs = @(
-        "-cp", "$fullCp",
-        "$TOKEN_GEN_CLASS_NAME",
-        $DestinationPath,
-        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($confInReg.ServiceIp):$($confInReg.HdfsRpcPort)",
-        "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($confInReg.ServiceFqdn):$($confInReg.HdfsRpcPort)",
-        "RM_DELEGATION_TOKEN",   $RmTok,   "$($confInReg.ServiceIp):$($confInReg.RmRpcPort)",
-        "RM_DELEGATION_TOKEN",   $RmTok,   "$($confInReg.ServiceFqdn):$($confInReg.RmRpcPort)"
-    )
+    try {
+        # Build arguments array to handle paths with spaces safely via Splatting
+        $javaArgs = @(
+            "-cp", "$fullCp",
+            "$TOKEN_GEN_CLASS_NAME",
+            $DestinationPath,
+            "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($confInReg.ServiceIp):$($confInReg.HdfsRpcPort)",
+            "HDFS_DELEGATION_TOKEN", $HdfsTok, "$($confInReg.ServiceFqdn):$($confInReg.HdfsRpcPort)",
+            "RM_DELEGATION_TOKEN",   $RmTok,   "$($confInReg.ServiceIp):$($confInReg.RmRpcPort)",
+            "RM_DELEGATION_TOKEN",   $RmTok,   "$($confInReg.ServiceFqdn):$($confInReg.RmRpcPort)"
+        )
 
-    # Invoke Java binary helper
-    $output = & java @javaArgs 2>&1
-    $exitCode = $LASTEXITCODE
+        # Invoke Java binary helper
+        $output = & $javaExe @javaArgs 2>&1
+        $exitCode = $LASTEXITCODE
 
-    # Restore previous preference states
-    $ErrorActionPreference = $savedEap
-    $env:HADOOP_TOKEN_FILE_LOCATION = $savedEnv
-
-    if (-not $Quiet) {
-        $output | ForEach-Object {
-            if ($_ -match "ERROR|Exception|Fail") {
-                Write-Host $_ -ForegroundColor Red
-            } else {
-                Write-Host $_
+        if (-not $Quiet) {
+            $output | ForEach-Object {
+                # Safely convert ErrorRecord objects to strings before pattern matching
+                $line = $_.ToString()
+                if ($line -match "ERROR|Exception|Fail") {
+                    Write-Host $line -ForegroundColor Red
+                } else {
+                    Write-Host $line
+                }
             }
         }
-    }
 
-    if ($exitCode -ne 0) { throw "MakeCredsFile failed with exit code $exitCode" }
-    if (-not (Test-Path $DestinationPath)) { throw "Target file $DestinationPath was not created by Java helper." }
+        if ($exitCode -ne 0) { throw "MakeCredsFile failed with exit code $exitCode" }
+        if (-not (Test-Path $DestinationPath)) { throw "Target file $DestinationPath was not created by Java helper." }
+    } finally {
+        # Always restore previous preference states and environment variable
+        $ErrorActionPreference = $savedEap
+        $env:HADOOP_TOKEN_FILE_LOCATION = $savedEnv
+    }
 
     # Lock down file permissions immediately after creation
     Protect-TokenFile $DestinationPath
@@ -469,7 +530,7 @@ function Write-CredsFile {
 
 if ($Out) {
     Write-CredsFile -DestinationPath $Out -HdfsTok (New-HdfsToken) -RmTok (New-RmToken)
-    return
+    exit 0
 }
 
 # ==============================================================================
