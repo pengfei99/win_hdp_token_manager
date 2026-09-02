@@ -42,6 +42,19 @@ param(
 $ErrorActionPreference = "Stop"
 Set-StrictMode -Version Latest
 
+# Reads an environment variable that may not exist.
+# Under Set-StrictMode -Version Latest, `$env:UNDEFINED` throws instead of
+# returning $null, so read via the provider which is strict-mode safe.
+function Get-EnvVar {
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$Name
+    )
+    $v = Get-Item -Path "Env:$Name" -ErrorAction SilentlyContinue
+    if ($null -eq $v) { return $null }
+    return [string]$v.Value
+}
+
 # User-level registry locations for configuration and active session state tracking.
 $REG      = "HKCU:\Software\CASD\Hadoop"
 $REG_SESS = "$REG\Sessions"
@@ -119,38 +132,72 @@ $confInReg = Get-HadoopConfig
     Path to the token file requiring ACL hardening.
 #>
 function Protect-TokenFile {
-    param([string]$filePath)
-    if (-not (Test-Path $filePath)) { return }
+    param(
+        [Parameter(Mandatory = $true)]
+        [string]$filePath
+    )
+
+    if ([string]::IsNullOrWhiteSpace($filePath)) {
+        return
+    }
+
+    if (-not (Test-Path -LiteralPath $filePath -PathType Leaf)) {
+        return
+    }
 
     $currentUser = [System.Security.Principal.WindowsIdentity]::GetCurrent().Name
 
     try {
-        # Instantiate ACL object
-        $acl = Get-Acl $filePath
+        $fileInfo = New-Object System.IO.FileInfo($filePath)
+
+        # IMPORTANT:
+        # Only get the DACL / Access section.
+        # Do NOT request Audit/SACL, Owner, or Group sections.
+        $acl = $fileInfo.GetAccessControl(
+            [System.Security.AccessControl.AccessControlSections]::Access
+        )
 
         # Disable inheritance and remove inherited rules
         $acl.SetAccessRuleProtection($true, $false)
 
-        # Safely remove existing explicit rules (copy to array to avoid collection modification during enumeration)
-        $explicitRules = @($acl.Access | Where-Object { -not $_.IsInherited })
-        foreach ($rule in $explicitRules) {
-            $acl.RemoveAccessRule($rule) | Out-Null
+        # Remove all existing explicit access rules
+        $existingRules = @(
+            $acl.GetAccessRules(
+                $true,
+                $true,
+                [System.Security.Principal.NTAccount]
+            )
+        )
+
+        foreach ($rule in $existingRules) {
+            [void]$acl.RemoveAccessRule($rule)
         }
 
-        # Define explicit access rules using Enums to prevent localization bugs on non-English Windows
-        $fsRights = [System.Security.AccessControl.FileSystemRights]::FullControl
-        $acType   = [System.Security.AccessControl.AccessControlType]::Allow
+        $rights = [System.Security.AccessControl.FileSystemRights]::FullControl
+        $allow  = [System.Security.AccessControl.AccessControlType]::Allow
 
-        $accessRuleUser   = New-Object System.Security.AccessControl.FileSystemAccessRule($currentUser, $fsRights, $acType)
-        $accessRuleSystem = New-Object System.Security.AccessControl.FileSystemAccessRule("NT AUTHORITY\SYSTEM", $fsRights, $acType)
+        $userRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            $currentUser,
+            $rights,
+            $allow
+        )
 
-        $acl.AddAccessRule($accessRuleUser)
-        $acl.AddAccessRule($accessRuleSystem)
+        $systemRule = New-Object System.Security.AccessControl.FileSystemAccessRule(
+            "NT AUTHORITY\SYSTEM",
+            $rights,
+            $allow
+        )
 
-        # Apply hardened ACL back to the file
-        Set-Acl -Path $filePath -AclObject $acl
-    } catch {
-        Write-LogMessage "Failed to apply NTFS permissions to $filePath : $($_.Exception.Message)" "WARNING"
+        [void]$acl.AddAccessRule($userRule)
+        [void]$acl.AddAccessRule($systemRule)
+
+        # Apply only file access rules, not audit/security privilege sections
+        $fileInfo.SetAccessControl($acl)
+
+        Write-LogMessage "Secured token file ACL: $filePath"
+    }
+    catch {
+        Write-LogMessage "Failed to set ACLs on token file '$filePath'. Error: $($_.Exception.Message)" "WARNING"
     }
 }
 
@@ -185,16 +232,18 @@ function Invoke-Sso {
         $errorMessage = $_.Exception.Message
         $statusCode = $null
 
-        if ($_.Exception.Response) {
+        if ($_.Exception -and $_.Exception.Response) {
             $statusCode = [int]$_.Exception.Response.StatusCode
         }
 
-        # PowerShell natively populates ErrorDetails.Message with the HTTP response body
-        # for both PS 5.1 (WebException) and PS 7+ (HttpResponseException).
-        $responseBody = $_.ErrorDetails.Message
+        # STRICT MODE FIX: Safely check if ErrorDetails exists before accessing .Message
+        $responseBody = $null
+        if ($_.ErrorDetails -and $_.ErrorDetails.Message) {
+            $responseBody = $_.ErrorDetails.Message
+        }
 
         # Fallback for PS 5.1 if ErrorDetails is empty but stream is available
-        if ([string]::IsNullOrWhiteSpace($responseBody) -and $_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
+        if ([string]::IsNullOrWhiteSpace($responseBody) -and $_.Exception -and $_.Exception.Response -and $_.Exception.Response.GetResponseStream) {
             try {
                 $stream = $_.Exception.Response.GetResponseStream()
                 $reader = New-Object System.IO.StreamReader($stream)
@@ -229,8 +278,12 @@ function New-HdfsToken {
     $response = Invoke-Sso -Uri $endpoint
 
     $token = $null
-    if ($response -and $response.Token) {
-        $token = $response.Token.urlString
+    if ($response) {
+        $tokenObj = $response.Token
+        # STRICT MODE FIX: Verify Token object exists before reading urlString
+        if ($tokenObj -and $tokenObj.urlString) {
+            $token = $tokenObj.urlString
+        }
     }
 
     if (-not $token) { throw "Empty or malformed HDFS token returned by NameNode." }
@@ -427,9 +480,9 @@ function Write-CredsFile {
     # ========================================================================
 
     # 1. Locate Java executable explicitly
-    $javaBaseDir = $env:JAVA_HOME
+    $javaBaseDir = Get-EnvVar "JAVA_HOME"
     if ([string]::IsNullOrWhiteSpace($javaBaseDir)) {
-        $javaBaseDir = $env:JAVA_PATH # Fallback if JAVA_PATH is used instead
+        $javaBaseDir = Get-EnvVar "JAVA_PATH" # Fallback if JAVA_PATH is used instead
     }
 
     if ([string]::IsNullOrWhiteSpace($javaBaseDir)) {
@@ -446,8 +499,10 @@ function Write-CredsFile {
     $hadoopCp = ""
     $hdfsCmd = $null
 
-    if (-not [string]::IsNullOrWhiteSpace($env:HADOOP_HOME)) {
-        $hdfsCmd = Join-Path $env:HADOOP_HOME "bin\hdfs.cmd"
+    $hadoopHome = Get-EnvVar "HADOOP_HOME"
+
+    if (-not [string]::IsNullOrWhiteSpace($hadoopHome)) {
+        $hdfsCmd = Join-Path $hadoopHome "bin\hdfs.cmd"
     }
 
     if ($hdfsCmd -and (Test-Path -LiteralPath $hdfsCmd -PathType Leaf)) {
@@ -490,7 +545,7 @@ function Write-CredsFile {
     $fullCp = $cpParts -join ";"
 
     # Temporarily unset variable to prevent recursion during MakeCredsFile run
-    $savedEnv = $env:HADOOP_TOKEN_FILE_LOCATION
+    $savedEnv = Get-EnvVar "HADOOP_TOKEN_FILE_LOCATION"
     $env:HADOOP_TOKEN_FILE_LOCATION = $null
 
     $savedEap = $ErrorActionPreference
@@ -583,4 +638,4 @@ Set-ItemProperty -Path $sessionKey -Name "Created"   -Value $creationTime -Type 
 [Environment]::SetEnvironmentVariable("HADOOP_TOKEN_FILE_LOCATION", $tokenFilePath, "Process")
 $env:HADOOP_TOKEN_FILE_LOCATION = $tokenFilePath
 
-Write-LogMessage "Session tokens established ($env:USERNAME, renewer=$($confInReg.Renewer)): $tokenFilePath"
+Write-LogMessage "Session tokens established ($(Get-EnvVar 'USERNAME'), renewer=$($confInReg.Renewer)): $tokenFilePath"
