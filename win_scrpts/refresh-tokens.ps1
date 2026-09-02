@@ -421,20 +421,17 @@ function Write-CredsFile {
         [string]$HdfsTok,
         [string]$RmTok
     )
+
     # ========================================================================
     # Bypass polluted system PATH by using explicit environment variables
     # ========================================================================
-
-    # Verify Java is available
-    if (-not (Get-Command java -ErrorAction SilentlyContinue)) {
-        throw "Java executable not found in system PATH. Please install Java or update PATH."
-    }
 
     # 1. Locate Java executable explicitly
     $javaBaseDir = $env:JAVA_HOME
     if ([string]::IsNullOrWhiteSpace($javaBaseDir)) {
         $javaBaseDir = $env:JAVA_PATH # Fallback if JAVA_PATH is used instead
     }
+
     if ([string]::IsNullOrWhiteSpace($javaBaseDir)) {
         throw "Neither JAVA_HOME nor JAVA_PATH environment variables are set. Cannot locate Java executable."
     }
@@ -445,7 +442,7 @@ function Write-CredsFile {
         throw "Java executable not found at expected path: '$javaExe'. Please verify your JAVA_HOME or JAVA_PATH environment variable."
     }
 
-     # 2. Locate HDFS command explicitly to get the classpath
+    # 2. Locate HDFS command explicitly to get the classpath
     $hadoopCp = ""
     $hdfsCmd = $null
 
@@ -455,20 +452,35 @@ function Write-CredsFile {
 
     if ($hdfsCmd -and (Test-Path -LiteralPath $hdfsCmd -PathType Leaf)) {
         try {
-            # Use the explicit path to hdfs.cmd
-            $hadoopCp = (& $hdfsCmd classpath 2>$null | Out-String).Trim()
+            # Temporarily lower ErrorActionPreference so stderr warnings from hdfs.cmd don't trigger a script stop
+            $oldEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+
+            # Use the explicit path to hdfs.cmd.
+            # Remove 2>$null, which hide all outputs not the stderr warnings.
+            $hadoopCp = (& $hdfsCmd classpath | Out-String).Trim()
+
+            $ErrorActionPreference = $oldEap
         } catch {
-            Write-LogMessage "Could not determine Hadoop classpath via explicit HADOOP_HOME path." "WARNING"
+            Write-LogMessage "Could not determine Hadoop classpath via explicit HADOOP_HOME path. Error: $($_.Exception.Message)" "WARNING"
         }
     } elseif (Get-Command hdfs -ErrorAction SilentlyContinue) {
-        # Fallback to PATH only if HADOOP_HOME isn't set
+        # Fallback to PATH only if HADOOP_HOME isn't set or invalid
         try {
-            $hadoopCp = (hdfs classpath 2>$null | Out-String).Trim()
+            $oldEap = $ErrorActionPreference
+            $ErrorActionPreference = "Continue"
+            $hadoopCp = (hdfs classpath | Out-String).Trim()
+            $ErrorActionPreference = $oldEap
         } catch {
-            Write-LogMessage "Could not determine Hadoop classpath via 'hdfs classpath'." "WARNING"
+            Write-LogMessage "Could not determine Hadoop classpath via 'hdfs classpath'. Error: $($_.Exception.Message)" "WARNING"
         }
     } else {
-        Write-LogMessage "'hdfs' command not found. Skipping Hadoop classpath injection." "WARNING"
+        Write-LogMessage "'hdfs' command not found in HADOOP_HOME or system PATH." "WARNING"
+    }
+
+    # STRICT CHECK: Stop all if Hadoop classpath is empty
+    if ([string]::IsNullOrWhiteSpace($hadoopCp)) {
+        throw "Cannot load Hadoop classpath. Ensure HADOOP_HOME is set correctly and 'hdfs classpath' executes successfully."
     }
 
     $tokenGenCp = Join-Path $confInReg.ToolsPath $TOKEN_GEN_JAR_NAME
@@ -496,7 +508,7 @@ function Write-CredsFile {
             "RM_DELEGATION_TOKEN",   $RmTok,   "$($confInReg.ServiceFqdn):$($confInReg.RmRpcPort)"
         )
 
-        # Invoke Java binary helper
+        # Invoke Java binary helper using the EXPLICIT path
         $output = & $javaExe @javaArgs 2>&1
         $exitCode = $LASTEXITCODE
 
@@ -513,7 +525,7 @@ function Write-CredsFile {
         }
 
         if ($exitCode -ne 0) { throw "MakeCredsFile failed with exit code $exitCode" }
-        if (-not (Test-Path $DestinationPath)) { throw "Target file $DestinationPath was not created by Java helper." }
+        if (-not (Test-Path -LiteralPath $DestinationPath)) { throw "Target file $DestinationPath was not created by Java helper." }
     } finally {
         # Always restore previous preference states and environment variable
         $ErrorActionPreference = $savedEap
