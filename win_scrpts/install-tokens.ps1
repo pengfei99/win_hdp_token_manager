@@ -324,7 +324,7 @@ function global:spark-submit {
         `$localExitCode = `$LASTEXITCODE
     }
     catch {
-        Write-Error "Failed to execute spark-submit: `$_"
+        Write-Error "Failed to execute spark-submit: `$$_"
         `$localExitCode = 1
     }
     finally {
