@@ -87,7 +87,7 @@
                                 <!-- Sets the main entry point in MANIFEST.MF -->
                                 <transformer
                                         implementation="org.apache.maven.plugins.shade.resource.ManifestResourceTransformer">
-                                    <mainClass>com.hadoop.util.MakeCredsFile</mainClass>
+                                    <mainClass>org.casd.util.MakeCredsFile</mainClass>
                                 </transformer>
                             </transformers>
                             <!-- Filter out signed JAR signatures from dependencies to avoid SecurityException -->
