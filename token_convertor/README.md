@@ -57,6 +57,12 @@ cd token_convertor
 # compile the source file
 mvn clean compile
 
+# compile, run tests and build the jar
+mvn clean package
+
+# skip unit test
+mvn clean package -DskipTests
+
 # run unit tests
 mvn test
 ```
@@ -72,7 +78,11 @@ mvn test
 Output JAR (lightweight and fat) is written to:
 
 ```text
+# lightweight jar
 token_convertor/target/make-creds-file-1.0.0-SNAPSHOT.jar
+
+# fat jar
+token_convertor/target/make-creds-file-1.0.0-SNAPSHOT-shaded.jar
 ```
 
 > This filename is hardcoded and referenced by `refresh-tokens.ps1` and
@@ -86,12 +96,12 @@ token_convertor/target/make-creds-file-1.0.0-SNAPSHOT.jar
 java [-cp <classpath>] org.casd.util.MakeCredsFile <outFile> (<kind> <encodedTokenString> <service>)...
 ```
 
-| Argument             | Description |
-|----------------------|-------------|
-| `outFile`            | Path of the binary credentials (`.dt`) file to write. |
+| Argument             | Description                                                    |
+|----------------------|----------------------------------------------------------------|
+| `outFile`            | Path of the binary credentials (`.dt`) file to write.          |
 | `kind`               | Token kind — `HDFS_DELEGATION_TOKEN` or `RM_DELEGATION_TOKEN`. |
-| `encodedTokenString` | The base64 encoded delegation token string. |
-| `service`            | Target service as `fqdn:port` or `ip:port`. |
+| `encodedTokenString` | The base64 encoded delegation token string.                    |
+| `service`            | Target service as `fqdn:port` or `ip:port`.                    |
 
 You may pass any number of tokens; each token consumes **3** consecutive
 arguments (`kind`, `encodedTokenString`, `service`).
@@ -139,10 +149,10 @@ adapters in this repository.
 
 ## 5. Exit codes
 
-| Code | Meaning |
-|------|---------|
-| `0`  | Success. |
-| `1`  | I/O or serialization failure. |
+| Code | Meaning                          |
+|------|----------------------------------|
+| `0`  | Success.                         |
+| `1`  | I/O or serialization failure.    |
 | `2`  | Invalid arguments (usage error). |
 
 ## 6. Notes / Gotchas
