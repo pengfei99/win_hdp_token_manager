@@ -27,7 +27,7 @@
             <configuration>
               <transformers>
                 <transformer>
-                  <mainClass>com.hadoop.util.MakeCredsFile</mainClass>
+                  <mainClass>org.casd.util.MakeCredsFile</mainClass>
                 </transformer>
               </transformers>
               <filters>
@@ -46,24 +46,6 @@
       </plugin>
     </plugins>
   </build>
-  <dependencies>
-    <dependency>
-      <groupId>org.apache.hadoop</groupId>
-      <artifactId>hadoop-common</artifactId>
-      <version>3.4.3</version>
-      <scope>provided</scope>
-      <exclusions>
-        <exclusion>
-          <artifactId>reload4j</artifactId>
-          <groupId>ch.qos.reload4j</groupId>
-        </exclusion>
-        <exclusion>
-          <artifactId>slf4j-reload4j</artifactId>
-          <groupId>org.slf4j</groupId>
-        </exclusion>
-      </exclusions>
-    </dependency>
-  </dependencies>
   <properties>
     <maven.compiler.source>11</maven.compiler.source>
     <maven-shade-plugin.version>3.5.1</maven-shade-plugin.version>

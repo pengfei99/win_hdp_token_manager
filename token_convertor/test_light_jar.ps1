@@ -3,7 +3,7 @@ $hadoopCp = (hdfs classpath | Out-String).Trim()
 
 # 2. Combine with your compiled JAR path using a semicolon ';'
 $TOKEN_GEN_JAR_NAME = "make-creds-file-1.0.0-SNAPSHOT.jar"
-$fullCp = "$hadoopCp;target/$TOKEN_GEN_JAR_NAME"
+$fullCp = "$hadoopCp;jars/$TOKEN_GEN_JAR_NAME"
 $TOKEN_GEN_CLASS_NAME = "org.casd.util.MakeCredsFile"
 $DestinationPath = "C:\Users\pliu\Documents\git\win_hdp_token_manager\token_convertor\tmp\creds.dt"
 # to get the token string, you need to run:
