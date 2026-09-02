@@ -6,7 +6,7 @@ hadoop delegation tokens.
 ## Project contents
 
 This project has five submodules:
-1. install-tokens.ps1: 
+1. install-tokens.ps1: is the **one-time setup** script that configures a Windows PowerShell environment for secure Hadoop/YARN/Spark delegation-token management in multi-user (RDS) environments.
 2. refresh-tokens.ps1: automates the retrieval, local storage, tracking, and revocation
     of Hadoop HDFS and YARN Resource Manager delegation tokens
 3. token_convertor: A java class which converts a base64 encoded hadoop cluster delegation token into a binary file and stores it
