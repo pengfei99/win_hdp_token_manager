@@ -45,16 +45,16 @@
 [CmdletBinding()]
 param(
     [Parameter(Mandatory = $false, HelpMessage = "WebHDFS URL of the NameNode")]
-    [string] $NameNodeWeb = "https://deb13-spark1.casdds.casd:50470",
+    [string] $NameNodeWeb = "https://d1mutua-m01.casd.fr:50470",
 
     [Parameter(Mandatory = $false, HelpMessage = "ResourceManager Web UI URL")]
-    [string] $RmWeb       = "https://deb13-spark1.casdds.casd:8090",
+    [string] $RmWeb       = "https://d1mutua-m01.casd.fr:8090",
 
     [Parameter(Mandatory = $false, HelpMessage = "IP address of the service node")]
-    [string] $ServiceIp   = "10.50.5.203",
+    [string] $ServiceIp   = "192.168.38.11",
 
     [Parameter(Mandatory = $false, HelpMessage = "FQDN of the service node")]
-    [string] $ServiceFqdn = "deb13-spark1.casdds.casd",
+    [string] $ServiceFqdn = "d1mutua-m01.casd.fr",
 
     [Parameter(Mandatory = $false, HelpMessage = "Principal authorized to renew tokens")]
     [string] $Renewer     = "hdfs",
@@ -66,10 +66,10 @@ param(
     [string] $RmRpcPort   = "8032",
 
     [Parameter(Mandatory = $false, HelpMessage = "HDFS staging directory for Spark")]
-    [string] $StagingDir  = "hdfs://deb13-spark1.casdds.casd:9000/users",
+    [string] $StagingDir  = "hdfs://d1mutua-m01.casd.fr:9000/users",
 
     [Parameter(Mandatory = $false, HelpMessage = "Spark driver port")]
-    [int]    $DriverPort  = 20000
+    [int]    $DriverPort  = 7077
 )
 
 # ==============================================================================
@@ -187,7 +187,9 @@ function Protect-TokenDirectory {
         Write-Verbose "Secured token directory ACL: $DirectoryPath"
     }
     catch {
-        Write-Warning "Failed to set ACLs on token directory '$DirectoryPath'. Error: $($_.Exception.Message)"
+        $errMsg = "Unknown execution error"
+        if ($Error.Count -gt 0 -and $Error[0].Exception) { $errMsg = $Error[0].Exception.Message}
+        Write-Warning "Failed to set ACLs on token directory '$DirectoryPath'. Error: $errMsg"
     }
 }
 
@@ -374,7 +376,9 @@ function global:spark-submit {
         `$localExitCode = `$LASTEXITCODE
     }
     catch {
-        Write-Error "Failed to execute spark-submit: `$$_"
+        `$errMsg = "Unknown execution error"
+        if (`$Error.Count -gt 0 -and `$Error[0].Exception) { `$errMsg = `$Error[0].Exception.Message}
+        Write-Error "Failed to execute spark-submit: `$errMsg"
         `$localExitCode = 1
     }
     finally {
@@ -430,7 +434,9 @@ try {
     Write-Verbose "PowerShell profile updated: $profilePath"
 }
 catch {
-    Write-Error "Failed to write to PowerShell profile: $_"
+    $errMsg = "Unknown execution error"
+    if ($Error.Count -gt 0 -and $Error[0].Exception) { $errMsg = $Error[0].Exception.Message}
+    Write-Error "Failed to write to PowerShell profile: $errMsg"
 }
 
 #endregion 3
@@ -450,7 +456,9 @@ try {
 }
 catch {
     Write-Host " [FAILED]" -ForegroundColor Red
-    Write-Warning "Initial token generation failed. You may need to run refresh-tokens.ps1 manually. Error: $_"
+    $errMsg = "Unknown execution error"
+    if ($Error.Count -gt 0 -and $Error[0].Exception) { $errMsg = $Error[0].Exception.Message}
+    Write-Warning "Initial token generation failed. You may need to run refresh-tokens.ps1 manually. Error: $errMsg"
     # Do not throw here, as the environment setup (registry/profile) was still successful.
 }
 
