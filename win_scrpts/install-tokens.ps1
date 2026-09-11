@@ -83,7 +83,9 @@ $toolsDir = $PSScriptRoot
 $refreshScriptName = "refresh-tokens.ps1"
 $refreshScript = Join-Path $toolsDir $refreshScriptName
 
-$registryPath = "HKCU:\Software\CASD\Hadoop"
+$registryPath = "HKCU:\Software\CASD\test"
+$confRegPath = "HKLM:\Software\CASD\Hadoop"
+# $confRegPath = "HKCU:\Software\CASD\Hadoop"
 
 # Use CurrentUserAllHosts so the configuration is available to all PowerShell
 # hosts for the current user.
@@ -197,7 +199,7 @@ function Protect-TokenDirectory {
 
 
 # ==============================================================================
-#region 0. Pre-flight checks
+#region 0. Pre-flight checks, and conf value assign
 # ==============================================================================
 
 if (-not (Test-Path -LiteralPath $refreshScript -PathType Leaf)) {
@@ -222,6 +224,54 @@ if ([string]::IsNullOrWhiteSpace($env:HADOOP_CONF_DIR)) {
 if ([string]::IsNullOrWhiteSpace($env:SPARK_HOME)) {
     Write-Warning "SPARK_HOME is not defined. spark-submit may not work."
 }
+
+# Override default config value with registry values when they exist
+if (Test-Path -Path $confRegPath) {
+
+    $RegConf = Get-ItemProperty -Path $confRegPath
+
+    if ($null -ne $RegConf.NameNodeWeb) {
+        $NameNodeWeb = [string]$RegConf.NameNodeWeb
+    }
+
+    if ($null -ne $RegConf.RmWeb) {
+        $RmWeb = [string]$RegConf.RmWeb
+    }
+
+    if ($null -ne $RegConf.ServiceIp) {
+        $ServiceIp = [string]$RegConf.ServiceIp
+    }
+
+    if ($null -ne $RegConf.ServiceFqdn) {
+        $ServiceFqdn = [string]$RegConf.ServiceFqdn
+    }
+
+    if ($null -ne $RegConf.Renewer) {
+        $Renewer = [string]$RegConf.Renewer
+    }
+
+    if ($null -ne $RegConf.HdfsRpcPort) {
+        $HdfsRpcPort = [string]$RegConf.HdfsRpcPort
+    }
+
+    if ($null -ne $RegConf.RmRpcPort) {
+        $RmRpcPort = [string]$RegConf.RmRpcPort
+    }
+}
+else {
+    Write-Warning "Cluster configuration does not exist in registry path $confRegPath. Fall back to script default value."
+}
+
+Write-Host ""
+Write-Host "Effective Hadoop configuration:" -ForegroundColor Cyan
+Write-Host "  NameNodeWeb  : $NameNodeWeb"
+Write-Host "  RmWeb        : $RmWeb"
+Write-Host "  ServiceIp    : $ServiceIp"
+Write-Host "  ServiceFqdn  : $ServiceFqdn"
+Write-Host "  Renewer      : $Renewer"
+Write-Host "  HdfsRpcPort  : $HdfsRpcPort"
+Write-Host "  RmRpcPort    : $RmRpcPort"
+Write-Host ""
 
 #endregion 0
 
