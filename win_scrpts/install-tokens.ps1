@@ -83,7 +83,7 @@ $toolsDir = $PSScriptRoot
 $refreshScriptName = "refresh-tokens.ps1"
 $refreshScript = Join-Path $toolsDir $refreshScriptName
 
-$registryPath = "HKCU:\Software\CASD\test"
+$userRegPath = "HKCU:\Software\CASD\Hadoop"
 $confRegPath = "HKLM:\Software\CASD\Hadoop"
 # $confRegPath = "HKCU:\Software\CASD\Hadoop"
 
@@ -300,8 +300,8 @@ Protect-TokenDirectory -DirectoryPath $tokenDir
 #region 2. Registry configuration
 # ==============================================================================
 
-if (-not (Test-Path -LiteralPath $registryPath)) {
-    New-Item -Path $registryPath -Force | Out-Null
+if (-not (Test-Path -LiteralPath $userRegPath)) {
+    New-Item -Path $userRegPath -Force | Out-Null
 }
 
 # Prefer HADOOP_CONF_DIR if it is explicitly configured.
@@ -333,13 +333,13 @@ $conf = @{
 
 # Write or update each property in the registry
 foreach ($key in $conf.Keys) {
-    Set-ItemProperty -Path $registryPath -Name $key -Value $conf[$key] -Type String -Force
+    Set-ItemProperty -Path $userRegPath -Name $key -Value $conf[$key] -Type String -Force
 }
 
 # DriverPort is stored as a DWord (integer)
-Set-ItemProperty -Path $registryPath -Name "DriverPort" -Value $DriverPort -Type DWord -Force
+Set-ItemProperty -Path $userRegPath -Name "DriverPort" -Value $DriverPort -Type DWord -Force
 
-Write-Verbose "Configuration written to: $registryPath"
+Write-Verbose "Configuration written to: $userRegPath"
 
 #endregion 2
 
